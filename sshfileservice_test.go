@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -547,17 +548,8 @@ func TestRemoteDownloadSegmentsUseFixedRanges(t *testing.T) {
 	}
 }
 
-func TestDownloadRemoteFilesAssemblesSFTPSegments(t *testing.T) {
-	remoteRoot := t.TempDir()
-	remotePath := filepath.Join(remoteRoot, "source.bin")
-	payload := make([]byte, int(remoteDownloadSegmentSize*2+123))
-	for index := range payload {
-		payload[index] = byte(index % 251)
-	}
-	if err := os.WriteFile(remotePath, payload, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+func withTestSFTPClient(t *testing.T, remoteRoot string, fn func(*sftp.Client)) {
+	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	server, err := sftp.NewServer(serverConn, sftp.WithServerWorkingDirectory(remoteRoot))
 	if err != nil {
@@ -583,46 +575,126 @@ func TestDownloadRemoteFilesAssemblesSFTPSegments(t *testing.T) {
 			t.Error("测试 SFTP 服务未及时退出")
 		}
 	}()
+	fn(client)
+}
 
-	info, err := client.Lstat("source.bin")
-	if err != nil {
-		t.Fatalf("读取测试远程文件信息失败: %v", err)
+func TestDownloadRemoteFilesAssemblesSFTPSegments(t *testing.T) {
+	remoteRoot := t.TempDir()
+	remotePath := filepath.Join(remoteRoot, "source.bin")
+	payload := make([]byte, int(remoteDownloadSegmentSize*2+123))
+	for index := range payload {
+		payload[index] = byte(index % 251)
 	}
-	localPath := filepath.Join(t.TempDir(), "nested", "target.bin")
-	files, err := prepareRemoteDownloadFiles([]remoteTreeItem{{
-		remote: "source.bin",
-		local:  localPath,
-		info:   info,
-	}})
-	if err != nil {
-		t.Fatalf("准备测试下载文件失败: %v", err)
+	if err := os.WriteFile(remotePath, payload, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	defer cleanupRemoteDownloadFiles(files)
-	service := &FileService{}
-	taskContext, taskCancel := context.WithCancel(context.Background())
-	defer taskCancel()
-	taskID := service.createFileTask(
-		FileTask{Type: fileTaskTypeDownload, Total: int64(len(payload)), Files: 1},
-		taskContext,
-		taskCancel,
-	)
-	if err := service.downloadRemoteFiles(taskContext, client, files, taskID); err != nil {
-		t.Fatalf("执行分段下载失败: %v", err)
+
+	withTestSFTPClient(t, remoteRoot, func(client *sftp.Client) {
+		info, err := client.Lstat("source.bin")
+		if err != nil {
+			t.Fatalf("读取测试远程文件信息失败: %v", err)
+		}
+		localPath := filepath.Join(t.TempDir(), "nested", "target.bin")
+		files, err := prepareRemoteDownloadFiles([]remoteTreeItem{{
+			remote: "source.bin",
+			local:  localPath,
+			info:   info,
+		}})
+		if err != nil {
+			t.Fatalf("准备测试下载文件失败: %v", err)
+		}
+		defer cleanupRemoteDownloadFiles(files)
+		service := &FileService{}
+		taskContext, taskCancel := context.WithCancel(context.Background())
+		defer taskCancel()
+		taskID := service.createFileTask(
+			FileTask{Type: fileTaskTypeDownload, Total: int64(len(payload)), Files: 1},
+			taskContext,
+			taskCancel,
+		)
+		if err := service.downloadRemoteFiles(taskContext, client, files, taskID); err != nil {
+			t.Fatalf("执行分段下载失败: %v", err)
+		}
+		task := service.GetFileTasks().Tasks[0]
+		if task.Completed != int64(len(payload)) || task.DoneFiles != 1 {
+			t.Fatalf("下载任务进度 = (%d, %d), want (%d, 1)", task.Completed, task.DoneFiles, len(payload))
+		}
+		if err := finalizeRemoteDownloadFiles(files); err != nil {
+			t.Fatalf("完成测试下载失败: %v", err)
+		}
+		got, err := os.ReadFile(localPath)
+		if err != nil {
+			t.Fatalf("读取测试下载结果失败: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("分段下载结果不一致: got %d bytes, want %d", len(got), len(payload))
+		}
+	})
+}
+
+func TestDownloadRemoteSegmentReportsPackets(t *testing.T) {
+	remoteRoot := t.TempDir()
+	payload := make([]byte, int(remoteDownloadPacketSize*2+123))
+	for index := range payload {
+		payload[index] = byte(index % 251)
 	}
-	task := service.GetFileTasks().Tasks[0]
-	if task.Completed != int64(len(payload)) || task.DoneFiles != 1 {
-		t.Fatalf("下载任务进度 = (%d, %d), want (%d, 1)", task.Completed, task.DoneFiles, len(payload))
+	if err := os.WriteFile(filepath.Join(remoteRoot, "source.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := finalizeRemoteDownloadFiles(files); err != nil {
-		t.Fatalf("完成测试下载失败: %v", err)
-	}
-	got, err := os.ReadFile(localPath)
-	if err != nil {
-		t.Fatalf("读取测试下载结果失败: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("分段下载结果不一致: got %d bytes, want %d", len(got), len(payload))
-	}
+
+	withTestSFTPClient(t, remoteRoot, func(client *sftp.Client) {
+		info, err := client.Lstat("source.bin")
+		if err != nil {
+			t.Fatalf("读取测试远程文件信息失败: %v", err)
+		}
+		localPath := filepath.Join(t.TempDir(), "target.bin")
+		files, err := prepareRemoteDownloadFiles([]remoteTreeItem{{
+			remote: "source.bin",
+			local:  localPath,
+			info:   info,
+		}})
+		if err != nil {
+			t.Fatalf("准备测试下载文件失败: %v", err)
+		}
+		defer cleanupRemoteDownloadFiles(files)
+		if len(files) != 1 {
+			t.Fatalf("测试下载文件数 = %d, want 1", len(files))
+		}
+		segments := remoteDownloadSegments(files)
+		if len(segments) != 1 {
+			t.Fatalf("测试下载分段数 = %d, want 1", len(segments))
+		}
+
+		var writesMu sync.Mutex
+		var writes []int64
+		var doneCount int
+		if err := downloadRemoteSegment(context.Background(), client, segments[0], func(written int64, segmentDone bool) {
+			writesMu.Lock()
+			writes = append(writes, written)
+			if segmentDone {
+				doneCount++
+			}
+			writesMu.Unlock()
+		}); err != nil {
+			t.Fatalf("按包下载失败: %v", err)
+		}
+		if doneCount != 1 {
+			t.Fatalf("分段完成回调次数 = %d, want 1", doneCount)
+		}
+		if len(writes) != 3 {
+			t.Fatalf("进度回调次数 = %d, want 3", len(writes))
+		}
+		var total int64
+		for _, written := range writes {
+			if written <= 0 || written > remoteDownloadPacketSize {
+				t.Fatalf("单次进度 = %d, want 1..%d", written, remoteDownloadPacketSize)
+			}
+			total += written
+		}
+		if total != int64(len(payload)) {
+			t.Fatalf("累计进度 = %d, want %d", total, len(payload))
+		}
+	})
 }
 
 func TestCopySSHConfigSlicesAreIndependent(t *testing.T) {

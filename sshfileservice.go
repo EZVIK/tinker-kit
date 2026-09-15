@@ -440,6 +440,10 @@ const remoteArchiveProgressPollInterval = 500 * time.Millisecond
 const (
 	remoteDownloadWorkerCount       = 4
 	remoteDownloadSegmentSize int64 = 8 * 1024 * 1024
+	// 与 pkg/sftp 默认 maxPacket（32KiB）对齐：单次 ReadAt 一个包，靠并发而不是大 buffer 维持流水线。
+	remoteDownloadPacketSize int64 = 32 * 1024
+	// 任务事件与 SFTP 包解耦，合并进度推送，避免每个包都发全量快照。
+	remoteDownloadProgressEmitInterval = 80 * time.Millisecond
 	// 外层分段并发与 SFTP 包级并发分开限额，避免每个 worker 再展开默认的 64 个请求。
 	remoteDownloadSFTPRequestCount = 8
 )
@@ -2628,6 +2632,11 @@ type remoteDownloadSegment struct {
 	length int
 }
 
+type remoteDownloadPacket struct {
+	offset int64
+	length int
+}
+
 func prepareRemoteDownloadFiles(items []remoteTreeItem) ([]*remoteDownloadFile, error) {
 	for _, item := range items {
 		if !item.info.IsDir() {
@@ -2757,42 +2766,133 @@ func downloadRemoteSegment(
 	ctx context.Context,
 	client *sftp.Client,
 	segment remoteDownloadSegment,
-) (int64, error) {
+	onProgress func(int64, bool),
+) error {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return err
+	}
+	if segment.length == 0 {
+		if onProgress != nil {
+			onProgress(0, true)
+		}
+		return nil
 	}
 	remote, err := segment.file.openRemote(client)
 	if err != nil {
-		return 0, fmt.Errorf("打开远程文件 %q 失败: %w", segment.file.remotePath, err)
+		return fmt.Errorf("打开远程文件 %q 失败: %w", segment.file.remotePath, err)
 	}
-	buffer := make([]byte, segment.length)
-	read, readErr := remote.ReadAt(buffer, segment.offset)
-	if read != segment.length {
-		if readErr == nil || errors.Is(readErr, io.EOF) {
-			readErr = io.ErrUnexpectedEOF
+
+	packetSize := int(remoteDownloadPacketSize)
+	packetCount := (segment.length + packetSize - 1) / packetSize
+	workerCount := remoteDownloadSFTPRequestCount
+	if workerCount > packetCount {
+		workerCount = packetCount
+	}
+
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan remoteDownloadPacket)
+	var remaining atomic.Int64
+	remaining.Store(int64(segment.length))
+
+	var firstErr error
+	var firstErrMu sync.Mutex
+	setError := func(readErr error) {
+		if readErr == nil {
+			return
 		}
-		return int64(read), fmt.Errorf(
-			"读取远程文件 %q 的分段失败（偏移 %d，长度 %d）: %w",
-			segment.file.remotePath,
-			segment.offset,
-			segment.length,
-			readErr,
-		)
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = readErr
+			cancel()
+		}
+		firstErrMu.Unlock()
 	}
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return int64(read), fmt.Errorf("读取远程文件 %q 失败: %w", segment.file.remotePath, readErr)
+
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			buffer := make([]byte, packetSize)
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					chunk := buffer[:job.length]
+					read, readErr := remote.ReadAt(chunk, job.offset)
+					if read != job.length {
+						if readErr == nil || errors.Is(readErr, io.EOF) {
+							readErr = io.ErrUnexpectedEOF
+						}
+						setError(fmt.Errorf(
+							"读取远程文件 %q 的分段失败（偏移 %d，长度 %d）: %w",
+							segment.file.remotePath,
+							job.offset,
+							job.length,
+							readErr,
+						))
+						return
+					}
+					if readErr != nil && !errors.Is(readErr, io.EOF) {
+						setError(fmt.Errorf("读取远程文件 %q 失败: %w", segment.file.remotePath, readErr))
+						return
+					}
+					if err := workCtx.Err(); err != nil {
+						return
+					}
+					written, writeErr := segment.file.temp.WriteAt(chunk, job.offset)
+					if writeErr != nil {
+						setError(fmt.Errorf("写入下载文件 %q 失败: %w", segment.file.localPath, writeErr))
+						return
+					}
+					if written != job.length {
+						setError(fmt.Errorf("写入下载文件 %q: %w", segment.file.localPath, io.ErrShortWrite))
+						return
+					}
+					left := remaining.Add(-int64(written))
+					if onProgress != nil {
+						onProgress(int64(written), left == 0)
+					}
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for offset := 0; offset < segment.length; {
+			length := packetSize
+			if left := segment.length - offset; left < length {
+				length = left
+			}
+			select {
+			case <-workCtx.Done():
+				return
+			case jobs <- remoteDownloadPacket{offset: segment.offset + int64(offset), length: length}:
+				offset += length
+			}
+		}
+	}()
+	workers.Wait()
+
+	firstErrMu.Lock()
+	err = firstErr
+	firstErrMu.Unlock()
+	if err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return err
 	}
-	written, writeErr := segment.file.temp.WriteAt(buffer, segment.offset)
-	if writeErr != nil {
-		return int64(written), fmt.Errorf("写入下载文件 %q 失败: %w", segment.file.localPath, writeErr)
+	if remaining.Load() != 0 {
+		return fmt.Errorf("读取远程文件 %q 的分段未完成", segment.file.remotePath)
 	}
-	if written != segment.length {
-		return int64(written), fmt.Errorf("写入下载文件 %q: %w", segment.file.localPath, io.ErrShortWrite)
-	}
-	return int64(written), nil
+	return nil
 }
 
 func (s *FileService) downloadRemoteFiles(
@@ -2838,26 +2938,79 @@ func (s *FileService) downloadRemoteFiles(
 		}
 		firstErrMu.Unlock()
 	}
-	reportProgress := func(segment remoteDownloadSegment, written int64) {
-		total := completed.Add(written)
-		if segment.file.completedSegments.Add(1) == int32(segment.file.segmentCount) {
-			segment.file.closeRemote()
-			doneFiles.Add(1)
+
+	var currentFile atomic.Value
+	currentFile.Store("")
+	var progressMu sync.Mutex
+	var lastProgress time.Time
+	var progressTimer *time.Timer
+	stopProgressTimer := func() {
+		if progressTimer != nil {
+			progressTimer.Stop()
+			progressTimer = nil
 		}
+	}
+	emitProgress := func() {
 		if taskID == "" {
 			return
 		}
-		current := segment.file.remotePath
-		done := doneFiles.Load()
+		current, _ := currentFile.Load().(string)
+		total := completed.Load()
+		done := int(doneFiles.Load())
 		s.updateFileTask(taskID, func(task *fileTaskState) {
 			if total > task.Completed {
 				task.Completed = total
 			}
-			if int(done) > task.DoneFiles {
-				task.DoneFiles = int(done)
+			if done > task.DoneFiles {
+				task.DoneFiles = done
 			}
-			task.Current = current
+			if current != "" {
+				task.Current = current
+			}
 		})
+	}
+	scheduleProgress := func() {
+		if taskID == "" {
+			return
+		}
+		progressMu.Lock()
+		now := time.Now()
+		if lastProgress.IsZero() || now.Sub(lastProgress) >= remoteDownloadProgressEmitInterval {
+			lastProgress = now
+			stopProgressTimer()
+			progressMu.Unlock()
+			emitProgress()
+			return
+		}
+		if progressTimer == nil {
+			delay := remoteDownloadProgressEmitInterval - now.Sub(lastProgress)
+			progressTimer = time.AfterFunc(delay, func() {
+				progressMu.Lock()
+				lastProgress = time.Now()
+				progressTimer = nil
+				progressMu.Unlock()
+				emitProgress()
+			})
+		}
+		progressMu.Unlock()
+	}
+	defer func() {
+		progressMu.Lock()
+		stopProgressTimer()
+		progressMu.Unlock()
+		emitProgress()
+	}()
+
+	reportProgress := func(segment remoteDownloadSegment, written int64, segmentDone bool) {
+		completed.Add(written)
+		if segmentDone {
+			if segment.file.completedSegments.Add(1) == int32(segment.file.segmentCount) {
+				segment.file.closeRemote()
+				doneFiles.Add(1)
+			}
+		}
+		currentFile.Store(segment.file.remotePath)
+		scheduleProgress()
 	}
 
 	var workers sync.WaitGroup
@@ -2873,12 +3026,13 @@ func (s *FileService) downloadRemoteFiles(
 					if !ok {
 						return
 					}
-					written, err := downloadRemoteSegment(workCtx, client, segment)
+					err := downloadRemoteSegment(workCtx, client, segment, func(written int64, segmentDone bool) {
+						reportProgress(segment, written, segmentDone)
+					})
 					if err != nil {
 						setError(err)
 						return
 					}
-					reportProgress(segment, written)
 				}
 			}
 		}()

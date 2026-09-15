@@ -392,7 +392,7 @@ function archiveStem(value: string) {
   return name;
 }
 
-function formatBytes(value: number) {
+function formatBytes(value: number, precise = false) {
   if (!Number.isFinite(value) || value < 0) return '—';
   if (value < 1024) return `${value} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];
@@ -402,7 +402,9 @@ function formatBytes(value: number) {
     amount /= 1024;
     index++;
   } while (amount >= 1024 && index < units.length - 1);
-  return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[index]}`;
+  const fractionDigits = precise && index > 0 ? 1 : amount >= 10 ? 0 : 1;
+  const formatted = amount.toFixed(fractionDigits);
+  return `${precise ? formatted.replace(/\.0$/, '') : formatted} ${units[index]}`;
 }
 
 function timestampMillis(value: string) {
@@ -416,9 +418,101 @@ function formatRemoteTimestamp(value: string, locale: string) {
   return timestamp === null ? '—' : new Date(timestamp).toLocaleString(locale);
 }
 
-function taskPercent(task: FileTask) {
+function taskPercent(task: FileTask, completed = task.completed) {
   if (!task.total || task.total <= 0) return null;
-  return Math.max(0, Math.min(100, (task.completed / task.total) * 100));
+  return Math.max(0, Math.min(100, (completed / task.total) * 100));
+}
+
+const progressMinCatchUpDuration = 80;
+const progressMaxCatchUpDuration = 800;
+
+type ProgressAnimation = {
+  from: number;
+  to: number;
+  startedAt: number;
+  duration: number;
+};
+
+function progressCatchUpDuration(interval: number) {
+  return Math.max(
+    progressMinCatchUpDuration,
+    Math.min(progressMaxCatchUpDuration, interval),
+  );
+}
+
+function useDisplayedTaskCompleted(task: FileTask) {
+  const smooth = task.type === 'download';
+  const [displayed, setDisplayed] = useState(task.completed);
+  const displayedRef = useRef(task.completed);
+  const animationRef = useRef<ProgressAnimation | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const lastTargetAtRef = useRef<number | null>(null);
+
+  const animate = useCallback((now: number) => {
+    frameRef.current = null;
+    const animation = animationRef.current;
+    if (!animation) return;
+
+    const elapsed = Math.max(0, now - animation.startedAt);
+    const ratio = Math.min(1, elapsed / animation.duration);
+    const next =
+      ratio >= 1
+        ? animation.to
+        : Math.round(animation.from + (animation.to - animation.from) * ratio);
+    if (next !== displayedRef.current) {
+      displayedRef.current = next;
+      setDisplayed(next);
+    }
+
+    if (ratio < 1) {
+      frameRef.current = requestAnimationFrame(animate);
+    } else {
+      animationRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    const target = task.completed;
+    const current = displayedRef.current;
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!smooth || reducedMotion || target <= current) {
+      animationRef.current = null;
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current);
+        frameRef.current = null;
+      }
+      if (target !== current) {
+        displayedRef.current = target;
+        setDisplayed(target);
+      }
+      return;
+    }
+
+    if (animationRef.current?.to === target) return;
+    const now = performance.now();
+    const lastTargetAt = lastTargetAtRef.current;
+    lastTargetAtRef.current = now;
+    animationRef.current = {
+      from: current,
+      to: target,
+      startedAt: now,
+      duration: progressCatchUpDuration(
+        lastTargetAt === null ? progressMinCatchUpDuration : now - lastTargetAt,
+      ),
+    };
+    if (frameRef.current === null) {
+      frameRef.current = requestAnimationFrame(animate);
+    }
+  }, [animate, smooth, task.completed]);
+
+  useEffect(
+    () => () => {
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+    },
+    [],
+  );
+
+  return displayed;
 }
 
 function taskUsesByteProgress(task: FileTask) {
@@ -457,6 +551,67 @@ function taskStatusVariant(
   if (status === 'conflict') return 'outline';
   if (status === 'queued' || status === 'running' || status === 'scanning') return 'blue';
   return 'secondary';
+}
+
+function TaskProgressMeter({ task, compact = false }: { task: FileTask; compact?: boolean }) {
+  const { t } = useTranslation();
+  const completed = useDisplayedTaskCompleted(task);
+  const percent = taskPercent(task, completed);
+  const running = ['queued', 'running', 'scanning'].includes(task.status);
+  const progressWidth = percent ?? (task.status === 'success' ? 100 : 0);
+
+  if (compact) {
+    return (
+      <span
+        className={`relative h-1.5 w-20 overflow-hidden rounded-full bg-muted ${percent === null ? 'animate-pulse motion-reduce:animate-none' : ''}`}
+        aria-hidden="true"
+      >
+        <span
+          className="absolute inset-y-0 left-0 rounded-full bg-primary"
+          style={{ width: `${progressWidth}%` }}
+        />
+      </span>
+    );
+  }
+
+  const progressText =
+    task.type === 'extract' && task.total <= 0
+      ? t('sshFilesTool.taskExtractedUnknown', {
+          completed: formatBytes(completed),
+        })
+      : taskUsesByteProgress(task)
+        ? t('sshFilesTool.taskBytes', {
+            completed: formatBytes(completed, task.type === 'download'),
+            total: task.total ? formatBytes(task.total) : '—',
+          })
+        : task.files > 0
+          ? t('sshFilesTool.taskFiles', {
+              done: task.doneFiles,
+              total: task.files,
+            })
+          : t('sshFilesTool.taskBytes', {
+              completed: formatBytes(completed),
+              total: task.total ? formatBytes(task.total) : '—',
+            });
+
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <div
+        className={`h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted ${percent === null && running ? 'animate-pulse motion-reduce:animate-none' : ''}`}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent ?? undefined}
+        aria-valuetext={progressText}
+      >
+        <div
+          className={`h-full rounded-full ${task.status === 'success' ? 'bg-success' : task.status === 'failed' ? 'bg-destructive' : 'bg-primary'}`}
+          style={{ width: `${progressWidth}%` }}
+        />
+      </div>
+      <span className="flex-none font-mono text-[10px] text-muted-foreground">{progressText}</span>
+    </div>
+  );
 }
 
 function errorMessage(error: unknown) {
@@ -685,10 +840,7 @@ export default function SshFilesTool({ active }: Props) {
       sourceRequest = GetFileSources();
       loadingCallsRef.current.add(connectionRequest);
       loadingCallsRef.current.add(sourceRequest);
-      const [nextConnections, nextSources] = await Promise.all([
-        connectionRequest,
-        sourceRequest,
-      ]);
+      const [nextConnections, nextSources] = await Promise.all([connectionRequest, sourceRequest]);
       if (requestID !== sourcesRequestRef.current) return;
       setConnections(nextConnections ?? []);
       setSources(nextSources ?? []);
@@ -1090,7 +1242,9 @@ export default function SshFilesTool({ active }: Props) {
       await SaveSSHFileConfig(connections, nextSources);
       setSources(nextSources);
       setSourceDraft((current) =>
-        current.id === pending.sourceID ? { ...current, favoritePaths: nextFavoritePaths } : current,
+        current.id === pending.sourceID
+          ? { ...current, favoritePaths: nextFavoritePaths }
+          : current,
       );
       setMissingFavoritePath(null);
       if (sourceID === pending.sourceID && pending.previousPath !== pending.path) {
@@ -1166,7 +1320,7 @@ export default function SshFilesTool({ active }: Props) {
                   `${remoteParent(normalizedPaths[0])}/${archiveStem(normalizedPaths[0])}`,
                 )
               : currentPath
-          : currentPath;
+            : currentPath;
     setOperationDialog({ operation, paths: normalizedPaths, value });
   };
 
@@ -1192,13 +1346,7 @@ export default function SshFilesTool({ active }: Props) {
         setSelected([]);
         return { status: 'started' };
       }
-      const result = await OperateRemoteFiles(
-        sourceID,
-        operation,
-        paths,
-        target,
-        conflictPolicy,
-      );
+      const result = await OperateRemoteFiles(sourceID, operation, paths, target, conflictPolicy);
       if (result?.conflicts?.length) {
         return { status: 'conflict', paths: result.conflicts };
       }
@@ -1464,16 +1612,14 @@ export default function SshFilesTool({ active }: Props) {
     setManageFeedback(null);
   };
 
-  const connectionDraftDirty =
-    connections.some((candidate) => candidate.id === connectionDraft.id)
-      ? JSON.stringify(connectionDraft) !==
-        JSON.stringify(connections.find((candidate) => candidate.id === connectionDraft.id))
-      : JSON.stringify(connectionDraft) !== JSON.stringify(manageNewConnectionBaselineRef.current);
+  const connectionDraftDirty = connections.some((candidate) => candidate.id === connectionDraft.id)
+    ? JSON.stringify(connectionDraft) !==
+      JSON.stringify(connections.find((candidate) => candidate.id === connectionDraft.id))
+    : JSON.stringify(connectionDraft) !== JSON.stringify(manageNewConnectionBaselineRef.current);
   const savedSourceDraft = sources.find((candidate) => candidate.id === sourceDraft.id);
-  const sourceDraftDirty =
-    savedSourceDraft
-      ? JSON.stringify(sourceDraft) !== JSON.stringify(savedSourceDraft)
-      : JSON.stringify(sourceDraft) !== JSON.stringify(manageNewSourceBaselineRef.current);
+  const sourceDraftDirty = savedSourceDraft
+    ? JSON.stringify(sourceDraft) !== JSON.stringify(savedSourceDraft)
+    : JSON.stringify(sourceDraft) !== JSON.stringify(manageNewSourceBaselineRef.current);
   const manageCollectionDirty =
     JSON.stringify(connections) !== JSON.stringify(manageBaselineRef.current.connections) ||
     JSON.stringify(sources) !== JSON.stringify(manageBaselineRef.current.sources);
@@ -1483,8 +1629,7 @@ export default function SshFilesTool({ active }: Props) {
       : manageView === 'source'
         ? sourceDraftDirty
         : false;
-  const manageDirty =
-    manageCollectionDirty || manageFormDirty;
+  const manageDirty = manageCollectionDirty || manageFormDirty;
   const editConnection = (item: SSHConnection) => {
     manageNewConnectionBaselineRef.current = { ...item };
     setManageView('connection');
@@ -1499,9 +1644,7 @@ export default function SshFilesTool({ active }: Props) {
     setManageTab('source');
     setManageEditor('source');
     setSourceDraft({ ...item });
-    const linkedConnection = connections.find(
-      (candidate) => candidate.id === item.sshConnectionID,
-    );
+    const linkedConnection = connections.find((candidate) => candidate.id === item.sshConnectionID);
     if (linkedConnection) setConnectionDraft({ ...linkedConnection });
     setManageFeedback(null);
   };
@@ -1739,8 +1882,6 @@ export default function SshFilesTool({ active }: Props) {
       return (leftValue - rightValue) * direction;
     });
   }, [entries, i18n.language, sizeValues, sortDirection, sortKey]);
-  const taskProgress =
-    activeTasks.length === 1 && activeTasks[0].total > 0 ? taskPercent(activeTasks[0]) : null;
   const calculatingSizePaths = useMemo(
     () =>
       new Set(
@@ -1788,10 +1929,10 @@ export default function SshFilesTool({ active }: Props) {
   const sourceConnection = availableConnections.find((item) => item.id === sourceConnectionID);
   const sourceReady = Boolean(
     sourceDraft.id &&
-      sourceDraft.name.trim() &&
-      sourceConnectionID &&
-      sourceConnection &&
-      (sourceConnection.id !== connectionDraft.id || connectionReady),
+    sourceDraft.name.trim() &&
+    sourceConnectionID &&
+    sourceConnection &&
+    (sourceConnection.id !== connectionDraft.id || connectionReady),
   );
   const connectionSummary = (item: SSHConnection) =>
     item.mode === 'local'
@@ -2149,9 +2290,7 @@ export default function SshFilesTool({ active }: Props) {
                     </DropdownMenuItem>
                   ))
                 ) : (
-                  <DropdownMenuItem disabled>
-                    {t('sshFilesTool.noFavorites')}
-                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled>{t('sshFilesTool.noFavorites')}</DropdownMenuItem>
                 )}
               </DropdownMenuGroup>
               <DropdownMenuSeparator />
@@ -2200,421 +2339,421 @@ export default function SshFilesTool({ active }: Props) {
               />
             }
           >
-          {fileDrag.over ? (
-            <span className="sr-only" role="status">
-              {t('fileDrop.release')}
-            </span>
-          ) : null}
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-2 z-20 flex items-center justify-center rounded-lg border border-dashed border-primary bg-primary/10 px-4 py-3 text-primary opacity-0 group-data-[over=true]/file-drop:opacity-100 group-[.file-drop-target-active]/file-drop:opacity-100"
-          >
-            <span className="flex items-center gap-2 text-xs font-medium">
-              <UploadSimple size={16} weight="duotone" />
-              {t('fileDrop.release')}
-            </span>
-          </div>
-          {loadingSources ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <Spinner />
-              <span className="text-sm text-muted-foreground">
-                {t('sshFilesTool.loadingSources')}
+            {fileDrag.over ? (
+              <span className="sr-only" role="status">
+                {t('fileDrop.release')}
               </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="mt-1 h-7 px-2 text-xs"
-                onClick={cancelLoading}
-              >
-                <XCircle data-icon="inline-start" size={14} />
-                {t('common.cancel')}
-              </Button>
+            ) : null}
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-2 z-20 flex items-center justify-center rounded-lg border border-dashed border-primary bg-primary/10 px-4 py-3 text-primary opacity-0 group-data-[over=true]/file-drop:opacity-100 group-[.file-drop-target-active]/file-drop:opacity-100"
+            >
+              <span className="flex items-center gap-2 text-xs font-medium">
+                <UploadSimple size={16} weight="duotone" />
+                {t('fileDrop.release')}
+              </span>
             </div>
-          ) : loading ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <Spinner />
-              <span className="text-sm text-muted-foreground">
-                {searching ? t('sshFilesTool.searching') : t('sshFilesTool.loadingDirectory')}
-              </span>
-              <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
-                {currentPath}
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="mt-1 h-7 px-2 text-xs"
-                onClick={cancelLoading}
-              >
-                <XCircle data-icon="inline-start" size={14} />
-                {t('common.cancel')}
-              </Button>
-            </div>
-          ) : loadingCanceled ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <XCircle size={16} weight="duotone" className="text-muted-foreground" />
-              <span className="text-sm text-muted-foreground">
-                {t('sshFilesTool.loadingCanceled')}
-              </span>
-              <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
-                {t('sshFilesTool.loadingCanceledHint')}
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="mt-1 h-7 px-2 text-xs"
-                onClick={retryCanceledLoading}
-              >
-                <ArrowClockwise data-icon="inline-start" size={14} />
-                {t('sshFilesTool.refresh')}
-              </Button>
-            </div>
-          ) : !sourceID ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <HardDrives size={30} weight="duotone" className="text-muted-foreground" />
-              <div className="text-sm font-medium text-foreground">{t('sshFilesTool.empty')}</div>
-              <div className="max-w-sm text-xs text-muted-foreground">
-                {t('sshFilesTool.emptyHint')}
+            {loadingSources ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <Spinner />
+                <span className="text-sm text-muted-foreground">
+                  {t('sshFilesTool.loadingSources')}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-1 h-7 px-2 text-xs"
+                  onClick={cancelLoading}
+                >
+                  <XCircle data-icon="inline-start" size={14} />
+                  {t('common.cancel')}
+                </Button>
               </div>
-              <Button variant="outline" className="mt-1 h-8 text-xs" onClick={openManage}>
-                {t('sshFilesTool.addSource')}
-              </Button>
-            </div>
-          ) : error ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <XCircle size={30} weight="duotone" className="text-destructive" />
-              <div className="text-sm font-medium text-foreground">
-                {t(searchActive ? 'sshFilesTool.searchFailed' : 'sshFilesTool.loadFailed')}
+            ) : loading ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <Spinner />
+                <span className="text-sm text-muted-foreground">
+                  {searching ? t('sshFilesTool.searching') : t('sshFilesTool.loadingDirectory')}
+                </span>
+                <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
+                  {currentPath}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-1 h-7 px-2 text-xs"
+                  onClick={cancelLoading}
+                >
+                  <XCircle data-icon="inline-start" size={14} />
+                  {t('common.cancel')}
+                </Button>
               </div>
-              <div className="max-w-lg break-words text-xs text-muted-foreground">{error}</div>
-              <Button
-                variant="outline"
-                className="mt-1 h-8 text-xs"
-                onClick={() =>
-                  searchActive && searchQuery
-                    ? void executeSearch(searchQuery)
-                    : void loadDirectory(sourceID, currentPath, showHidden)
-                }
-              >
-                <ArrowClockwise data-icon="inline-start" size={14} />
-                {t('sshFilesTool.refresh')}
-              </Button>
-            </div>
-          ) : entries.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-              {searchActive ? (
-                <MagnifyingGlass size={30} weight="duotone" className="text-muted-foreground" />
-              ) : (
-                <Folder size={30} weight="duotone" className="text-muted-foreground" />
-              )}
-              <div className="text-sm font-medium text-foreground">
-                {t(searchActive ? 'sshFilesTool.searchNoResults' : 'sshFilesTool.directoryEmpty')}
+            ) : loadingCanceled ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <XCircle size={16} weight="duotone" className="text-muted-foreground" />
+                <span className="text-sm text-muted-foreground">
+                  {t('sshFilesTool.loadingCanceled')}
+                </span>
+                <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
+                  {t('sshFilesTool.loadingCanceledHint')}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-1 h-7 px-2 text-xs"
+                  onClick={retryCanceledLoading}
+                >
+                  <ArrowClockwise data-icon="inline-start" size={14} />
+                  {t('sshFilesTool.refresh')}
+                </Button>
               </div>
-              <div className="max-w-sm text-xs text-muted-foreground">
-                {t(
-                  searchActive
-                    ? 'sshFilesTool.searchNoResultsHint'
-                    : 'sshFilesTool.directoryEmptyHint',
+            ) : !sourceID ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <HardDrives size={30} weight="duotone" className="text-muted-foreground" />
+                <div className="text-sm font-medium text-foreground">{t('sshFilesTool.empty')}</div>
+                <div className="max-w-sm text-xs text-muted-foreground">
+                  {t('sshFilesTool.emptyHint')}
+                </div>
+                <Button variant="outline" className="mt-1 h-8 text-xs" onClick={openManage}>
+                  {t('sshFilesTool.addSource')}
+                </Button>
+              </div>
+            ) : error ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <XCircle size={30} weight="duotone" className="text-destructive" />
+                <div className="text-sm font-medium text-foreground">
+                  {t(searchActive ? 'sshFilesTool.searchFailed' : 'sshFilesTool.loadFailed')}
+                </div>
+                <div className="max-w-lg break-words text-xs text-muted-foreground">{error}</div>
+                <Button
+                  variant="outline"
+                  className="mt-1 h-8 text-xs"
+                  onClick={() =>
+                    searchActive && searchQuery
+                      ? void executeSearch(searchQuery)
+                      : void loadDirectory(sourceID, currentPath, showHidden)
+                  }
+                >
+                  <ArrowClockwise data-icon="inline-start" size={14} />
+                  {t('sshFilesTool.refresh')}
+                </Button>
+              </div>
+            ) : entries.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+                {searchActive ? (
+                  <MagnifyingGlass size={30} weight="duotone" className="text-muted-foreground" />
+                ) : (
+                  <Folder size={30} weight="duotone" className="text-muted-foreground" />
                 )}
+                <div className="text-sm font-medium text-foreground">
+                  {t(searchActive ? 'sshFilesTool.searchNoResults' : 'sshFilesTool.directoryEmpty')}
+                </div>
+                <div className="max-w-sm text-xs text-muted-foreground">
+                  {t(
+                    searchActive
+                      ? 'sshFilesTool.searchNoResultsHint'
+                      : 'sshFilesTool.directoryEmptyHint',
+                  )}
+                </div>
               </div>
-            </div>
-          ) : (
-            <Table className="min-w-[840px] text-xs" containerClassName="overflow-visible">
-              <TableHeader className="sticky top-0 z-10 bg-background">
-                <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-10 px-3 text-[10px] text-muted-foreground">
-                    <Checkbox
-                      checked={entries.length > 0 && selected.length === entries.length}
-                      indeterminate={selected.length > 0 && selected.length < entries.length}
-                      onCheckedChange={(checked) =>
-                        setSelected(checked === true ? entries.map((item) => item.path) : [])
-                      }
-                      aria-label={t(
-                        searchActive
-                          ? 'sshFilesTool.selectAllSearchResults'
-                          : 'sshFilesTool.selectAll',
-                      )}
-                    />
-                  </TableHead>
-                  <TableHead
-                    className="min-w-[280px] text-[10px] text-muted-foreground"
-                    aria-sort={
-                      sortKey === 'name'
-                        ? sortDirection === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'
-                    }
-                  >
-                    {sortableHeader('name', t('sshFilesTool.name'))}
-                  </TableHead>
-                  <TableHead
-                    className="w-32 text-[10px] text-muted-foreground"
-                    aria-sort={
-                      sortKey === 'size'
-                        ? sortDirection === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'
-                    }
-                  >
-                    {sortableHeader('size', t('sshFilesTool.size'))}
-                  </TableHead>
-                  <TableHead
-                    className="w-44 text-[10px] text-muted-foreground"
-                    aria-sort={
-                      sortKey === 'modifiedAt'
-                        ? sortDirection === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'
-                    }
-                  >
-                    {sortableHeader('modifiedAt', t('sshFilesTool.modified'))}
-                  </TableHead>
-                  <TableHead
-                    className="w-44 text-[10px] text-muted-foreground"
-                    aria-sort={
-                      sortKey === 'createdAt'
-                        ? sortDirection === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'
-                    }
-                  >
-                    {sortableHeader('createdAt', t('sshFilesTool.created'))}
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {sortedEntries.map((entry) => {
-                  const operationPaths = operationPathsFor(entry.path);
-                  const archiveSelection = operationPaths.every(isArchivePath);
-                  const parentPath = searchActive ? remoteParent(entry.path) : '';
-                  const isEntryFavorite = entry.isDir && favoritePaths.includes(entry.path);
-                  const EntryIcon = entry.isDir
-                    ? isEntryFavorite
-                      ? FolderStar
-                      : Folder
-                    : remoteFileIcon(entry.path);
-                  return (
-                    <ContextMenu key={entry.path}>
-                      <ContextMenuTrigger
-                        render={
-                          <TableRow
-                            draggable
-                            aria-busy={dragPreparing === entry.path}
-                            data-state={selected.includes(entry.path) ? 'selected' : undefined}
-                            className="group select-none border-border/60"
-                            onContextMenu={() => {
-                              if (!selected.includes(entry.path)) setSelected([entry.path]);
-                            }}
-                            onPointerDown={(event) => {
-                              if (event.button !== 0) return;
-                              const target = event.target as HTMLElement;
-                              if (!target.closest('button, input')) prepareDrag(entry);
-                            }}
-                            onDragStart={(event) => {
-                              event.dataTransfer.effectAllowed = 'copy';
-                              const local =
-                                readyDragPath?.remote === entry.path ? readyDragPath.local : '';
-                              if (!local) {
-                                event.preventDefault();
-                                toast.add({
-                                  title: t('sshFilesTool.dragPreparing'),
-                                  type: 'info',
-                                });
-                                return;
-                              }
-                              const uri = new URL(`file://${local}`).href;
-                              event.dataTransfer.setData('text/uri-list', `${uri}\r\n`);
-                              event.dataTransfer.setData(
-                                'DownloadURL',
-                                `application/octet-stream:${entry.name}:${uri}`,
-                              );
-                              event.dataTransfer.setData('text/plain', local);
-                              event.dataTransfer.setData(
-                                'application/x-tinkerkit-remote-file',
-                                JSON.stringify({ sourceID, path: entry.path }),
-                              );
-                            }}
-                            onDragEnd={() => {
-                              setDragReady(null);
-                              setDragPreparing('');
-                            }}
-                          />
-                        }
-                      >
-                    <TableCell className="w-10 px-3 py-2">
+            ) : (
+              <Table className="min-w-[840px] text-xs" containerClassName="overflow-visible">
+                <TableHeader className="sticky top-0 z-10 bg-background">
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-10 px-3 text-[10px] text-muted-foreground">
                       <Checkbox
-                        checked={selected.includes(entry.path)}
+                        checked={entries.length > 0 && selected.length === entries.length}
+                        indeterminate={selected.length > 0 && selected.length < entries.length}
                         onCheckedChange={(checked) =>
-                          setSelected((current) =>
-                            checked
-                              ? [...current, entry.path]
-                              : current.filter((item) => item !== entry.path),
-                          )
+                          setSelected(checked === true ? entries.map((item) => item.path) : [])
                         }
-                        aria-label={entry.name}
+                        aria-label={t(
+                          searchActive
+                            ? 'sshFilesTool.selectAllSearchResults'
+                            : 'sshFilesTool.selectAll',
+                        )}
                       />
-                    </TableCell>
-                    <TableCell className="min-w-[280px] max-w-0 py-2">
-                      <div className="min-w-0 max-w-full">
-                        <button
-                          type="button"
-                          className="flex w-full min-w-0 max-w-full items-center gap-2 text-left text-foreground hover:underline"
-                          title={entry.path}
-                          onClick={() =>
-                            entry.isDir
-                              ? navigate(entry.path)
-                              : void downloadSelected([entry.path])
+                    </TableHead>
+                    <TableHead
+                      className="min-w-[280px] text-[10px] text-muted-foreground"
+                      aria-sort={
+                        sortKey === 'name'
+                          ? sortDirection === 'asc'
+                            ? 'ascending'
+                            : 'descending'
+                          : 'none'
+                      }
+                    >
+                      {sortableHeader('name', t('sshFilesTool.name'))}
+                    </TableHead>
+                    <TableHead
+                      className="w-32 text-[10px] text-muted-foreground"
+                      aria-sort={
+                        sortKey === 'size'
+                          ? sortDirection === 'asc'
+                            ? 'ascending'
+                            : 'descending'
+                          : 'none'
+                      }
+                    >
+                      {sortableHeader('size', t('sshFilesTool.size'))}
+                    </TableHead>
+                    <TableHead
+                      className="w-44 text-[10px] text-muted-foreground"
+                      aria-sort={
+                        sortKey === 'modifiedAt'
+                          ? sortDirection === 'asc'
+                            ? 'ascending'
+                            : 'descending'
+                          : 'none'
+                      }
+                    >
+                      {sortableHeader('modifiedAt', t('sshFilesTool.modified'))}
+                    </TableHead>
+                    <TableHead
+                      className="w-44 text-[10px] text-muted-foreground"
+                      aria-sort={
+                        sortKey === 'createdAt'
+                          ? sortDirection === 'asc'
+                            ? 'ascending'
+                            : 'descending'
+                          : 'none'
+                      }
+                    >
+                      {sortableHeader('createdAt', t('sshFilesTool.created'))}
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {sortedEntries.map((entry) => {
+                    const operationPaths = operationPathsFor(entry.path);
+                    const archiveSelection = operationPaths.every(isArchivePath);
+                    const parentPath = searchActive ? remoteParent(entry.path) : '';
+                    const isEntryFavorite = entry.isDir && favoritePaths.includes(entry.path);
+                    const EntryIcon = entry.isDir
+                      ? isEntryFavorite
+                        ? FolderStar
+                        : Folder
+                      : remoteFileIcon(entry.path);
+                    return (
+                      <ContextMenu key={entry.path}>
+                        <ContextMenuTrigger
+                          render={
+                            <TableRow
+                              draggable
+                              aria-busy={dragPreparing === entry.path}
+                              data-state={selected.includes(entry.path) ? 'selected' : undefined}
+                              className="group select-none border-border/60"
+                              onContextMenu={() => {
+                                if (!selected.includes(entry.path)) setSelected([entry.path]);
+                              }}
+                              onPointerDown={(event) => {
+                                if (event.button !== 0) return;
+                                const target = event.target as HTMLElement;
+                                if (!target.closest('button, input')) prepareDrag(entry);
+                              }}
+                              onDragStart={(event) => {
+                                event.dataTransfer.effectAllowed = 'copy';
+                                const local =
+                                  readyDragPath?.remote === entry.path ? readyDragPath.local : '';
+                                if (!local) {
+                                  event.preventDefault();
+                                  toast.add({
+                                    title: t('sshFilesTool.dragPreparing'),
+                                    type: 'info',
+                                  });
+                                  return;
+                                }
+                                const uri = new URL(`file://${local}`).href;
+                                event.dataTransfer.setData('text/uri-list', `${uri}\r\n`);
+                                event.dataTransfer.setData(
+                                  'DownloadURL',
+                                  `application/octet-stream:${entry.name}:${uri}`,
+                                );
+                                event.dataTransfer.setData('text/plain', local);
+                                event.dataTransfer.setData(
+                                  'application/x-tinkerkit-remote-file',
+                                  JSON.stringify({ sourceID, path: entry.path }),
+                                );
+                              }}
+                              onDragEnd={() => {
+                                setDragReady(null);
+                                setDragPreparing('');
+                              }}
+                            />
                           }
                         >
-                          <EntryIcon
-                            size={16}
-                            weight="duotone"
-                            className="shrink-0 text-muted-foreground"
-                          />
-                          <span className="min-w-0 truncate">{entry.name}</span>
-                          {entry.isSymlink ? (
-                            <ArrowUpRight
-                              size={11}
-                              aria-label={t('sshFilesTool.symbolicLink')}
-                              className="shrink-0 text-muted-foreground"
+                          <TableCell className="w-10 px-3 py-2">
+                            <Checkbox
+                              checked={selected.includes(entry.path)}
+                              onCheckedChange={(checked) =>
+                                setSelected((current) =>
+                                  checked
+                                    ? [...current, entry.path]
+                                    : current.filter((item) => item !== entry.path),
+                                )
+                              }
+                              aria-label={entry.name}
                             />
-                          ) : null}
-                        </button>
-                        {parentPath ? (
-                          <button
-                            type="button"
-                            className="block w-full min-w-0 max-w-full truncate text-left text-[10px] text-muted-foreground hover:text-foreground hover:underline"
-                            title={parentPath}
-                            onClick={() => navigate(parentPath)}
-                          >
-                            {parentPath}
-                          </button>
-                        ) : null}
-                      </div>
-                    </TableCell>
-                    <TableCell className="w-32 py-2 text-muted-foreground">
-                      {entry.isDir ? (
-                        calculatingSizePaths.has(entry.path) ? (
-                          <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-                            <Spinner className="size-3" />
-                            {t('sshFilesTool.scanning')}
-                          </span>
-                        ) : sizeValues[entry.path] !== undefined ? (
-                          formatBytes(sizeValues[entry.path])
-                        ) : (
-                          <button
-                            type="button"
-                            className="text-primary underline underline-offset-2"
-                            disabled={calculatingSizePaths.has(entry.path)}
-                            onClick={() => void calculateSize(entry)}
-                          >
-                            {t('sshFilesTool.calculate')}
-                          </button>
-                        )
-                      ) : (
-                        formatBytes(entry.size)
-                      )}
-                    </TableCell>
-                    <TableCell className="w-44 py-2 text-muted-foreground">
-                      {formatRemoteTimestamp(entry.modifiedAt, i18n.language)}
-                    </TableCell>
-                    <TableCell className="w-44 py-2 text-muted-foreground">
-                      {formatRemoteTimestamp(entry.createdAt, i18n.language)}
-                    </TableCell>
-                      </ContextMenuTrigger>
-                      <ContextMenuContent className="min-w-44">
-                        <ContextMenuGroup>
-                          <ContextMenuItem
-                            disabled={operationRunning}
-                            onClick={() => void copyPathToClipboard(entry.path)}
-                          >
-                            <Copy size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.copyPath')}
-                          </ContextMenuItem>
-                          {entry.isDir ? (
+                          </TableCell>
+                          <TableCell className="min-w-[280px] max-w-0 py-2">
+                            <div className="min-w-0 max-w-full">
+                              <button
+                                type="button"
+                                className="flex w-full min-w-0 max-w-full items-center gap-2 text-left text-foreground hover:underline"
+                                title={entry.path}
+                                onClick={() =>
+                                  entry.isDir
+                                    ? navigate(entry.path)
+                                    : void downloadSelected([entry.path])
+                                }
+                              >
+                                <EntryIcon
+                                  size={16}
+                                  weight="duotone"
+                                  className="shrink-0 text-muted-foreground"
+                                />
+                                <span className="min-w-0 truncate">{entry.name}</span>
+                                {entry.isSymlink ? (
+                                  <ArrowUpRight
+                                    size={11}
+                                    aria-label={t('sshFilesTool.symbolicLink')}
+                                    className="shrink-0 text-muted-foreground"
+                                  />
+                                ) : null}
+                              </button>
+                              {parentPath ? (
+                                <button
+                                  type="button"
+                                  className="block w-full min-w-0 max-w-full truncate text-left text-[10px] text-muted-foreground hover:text-foreground hover:underline"
+                                  title={parentPath}
+                                  onClick={() => navigate(parentPath)}
+                                >
+                                  {parentPath}
+                                </button>
+                              ) : null}
+                            </div>
+                          </TableCell>
+                          <TableCell className="w-32 py-2 text-muted-foreground">
+                            {entry.isDir ? (
+                              calculatingSizePaths.has(entry.path) ? (
+                                <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                                  <Spinner className="size-3" />
+                                  {t('sshFilesTool.scanning')}
+                                </span>
+                              ) : sizeValues[entry.path] !== undefined ? (
+                                formatBytes(sizeValues[entry.path])
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="text-primary underline underline-offset-2"
+                                  disabled={calculatingSizePaths.has(entry.path)}
+                                  onClick={() => void calculateSize(entry)}
+                                >
+                                  {t('sshFilesTool.calculate')}
+                                </button>
+                              )
+                            ) : (
+                              formatBytes(entry.size)
+                            )}
+                          </TableCell>
+                          <TableCell className="w-44 py-2 text-muted-foreground">
+                            {formatRemoteTimestamp(entry.modifiedAt, i18n.language)}
+                          </TableCell>
+                          <TableCell className="w-44 py-2 text-muted-foreground">
+                            {formatRemoteTimestamp(entry.createdAt, i18n.language)}
+                          </TableCell>
+                        </ContextMenuTrigger>
+                        <ContextMenuContent className="min-w-44">
+                          <ContextMenuGroup>
                             <ContextMenuItem
-                              disabled={favoritesSaving}
-                              onClick={() => void toggleFavorite(entry.path)}
+                              disabled={operationRunning}
+                              onClick={() => void copyPathToClipboard(entry.path)}
                             >
-                              <Star
-                                size={14}
-                                weight={isEntryFavorite ? 'fill' : 'duotone'}
-                                aria-hidden="true"
-                              />
-                              {t(
-                                isEntryFavorite
-                                  ? 'sshFilesTool.removeFavoritePath'
-                                  : 'sshFilesTool.addFavoritePath',
-                              )}
+                              <Copy size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.copyPath')}
                             </ContextMenuItem>
-                          ) : null}
-                        </ContextMenuGroup>
-                        <ContextMenuSeparator />
-                        <ContextMenuGroup>
-                          <ContextMenuItem
-                            disabled={operationRunning}
-                            onClick={() => requestFileOperation('copy', operationPaths)}
-                          >
-                            <Copy size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.copy')}
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            disabled={operationRunning}
-                            onClick={() => requestFileOperation('move', operationPaths)}
-                          >
-                            <ArrowsLeftRight size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.move')}
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            disabled={operationRunning || operationPaths.length !== 1}
-                            onClick={() => requestFileOperation('rename', operationPaths)}
-                          >
-                            <PencilSimple size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.rename')}
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            variant="destructive"
-                            disabled={operationRunning}
-                            onClick={() => requestFileOperation('delete', operationPaths)}
-                          >
-                            <Trash size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.delete')}
-                          </ContextMenuItem>
-                        </ContextMenuGroup>
-                        <ContextMenuSeparator />
-                        <ContextMenuGroup>
-                          <ContextMenuItem
-                            disabled={operationRunning || !archiveSelection}
-                            onClick={() => requestFileOperation('extract', operationPaths)}
-                          >
-                            <FileArchive size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.extract')}
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            disabled={operationRunning}
-                            onClick={() => requestFileOperation('compress', operationPaths)}
-                          >
-                            <Archive size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.compress')}
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            disabled={operationRunning}
-                            onClick={() => void downloadSelected(operationPaths)}
-                          >
-                            <DownloadSimple size={14} weight="duotone" aria-hidden="true" />
-                            {t('sshFilesTool.download')}
-                          </ContextMenuItem>
-                        </ContextMenuGroup>
-                      </ContextMenuContent>
-                    </ContextMenu>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          )}
+                            {entry.isDir ? (
+                              <ContextMenuItem
+                                disabled={favoritesSaving}
+                                onClick={() => void toggleFavorite(entry.path)}
+                              >
+                                <Star
+                                  size={14}
+                                  weight={isEntryFavorite ? 'fill' : 'duotone'}
+                                  aria-hidden="true"
+                                />
+                                {t(
+                                  isEntryFavorite
+                                    ? 'sshFilesTool.removeFavoritePath'
+                                    : 'sshFilesTool.addFavoritePath',
+                                )}
+                              </ContextMenuItem>
+                            ) : null}
+                          </ContextMenuGroup>
+                          <ContextMenuSeparator />
+                          <ContextMenuGroup>
+                            <ContextMenuItem
+                              disabled={operationRunning}
+                              onClick={() => requestFileOperation('copy', operationPaths)}
+                            >
+                              <Copy size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.copy')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={operationRunning}
+                              onClick={() => requestFileOperation('move', operationPaths)}
+                            >
+                              <ArrowsLeftRight size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.move')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={operationRunning || operationPaths.length !== 1}
+                              onClick={() => requestFileOperation('rename', operationPaths)}
+                            >
+                              <PencilSimple size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.rename')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              variant="destructive"
+                              disabled={operationRunning}
+                              onClick={() => requestFileOperation('delete', operationPaths)}
+                            >
+                              <Trash size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.delete')}
+                            </ContextMenuItem>
+                          </ContextMenuGroup>
+                          <ContextMenuSeparator />
+                          <ContextMenuGroup>
+                            <ContextMenuItem
+                              disabled={operationRunning || !archiveSelection}
+                              onClick={() => requestFileOperation('extract', operationPaths)}
+                            >
+                              <FileArchive size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.extract')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={operationRunning}
+                              onClick={() => requestFileOperation('compress', operationPaths)}
+                            >
+                              <Archive size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.compress')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={operationRunning}
+                              onClick={() => void downloadSelected(operationPaths)}
+                            >
+                              <DownloadSimple size={14} weight="duotone" aria-hidden="true" />
+                              {t('sshFilesTool.download')}
+                            </ContextMenuItem>
+                          </ContextMenuGroup>
+                        </ContextMenuContent>
+                      </ContextMenu>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            )}
           </ContextMenuTrigger>
           <ContextMenuContent className="min-w-44">
             <ContextMenuGroup>
@@ -2625,10 +2764,7 @@ export default function SshFilesTool({ active }: Props) {
                 <Copy size={14} weight="duotone" aria-hidden="true" />
                 {t('sshFilesTool.copyPath')}
               </ContextMenuItem>
-              <ContextMenuItem
-                disabled={!sourceID || isLoading}
-                onClick={requestCreateFolder}
-              >
+              <ContextMenuItem disabled={!sourceID || isLoading} onClick={requestCreateFolder}>
                 <FolderSimplePlus size={14} weight="duotone" aria-hidden="true" />
                 {t('sshFilesTool.createFolder')}
               </ContextMenuItem>
@@ -2670,15 +2806,14 @@ export default function SshFilesTool({ active }: Props) {
               >
                 {activeTasks.length > 0 ? (
                   <>
-                    <span
-                      className={`relative h-1.5 w-20 overflow-hidden rounded-full bg-muted ${taskProgress === null ? 'animate-pulse motion-reduce:animate-none' : ''}`}
-                      aria-hidden="true"
-                    >
+                    {activeTasks.length === 1 ? (
+                      <TaskProgressMeter key={activeTasks[0].id} task={activeTasks[0]} compact />
+                    ) : (
                       <span
-                        className="absolute inset-y-0 left-0 rounded-full bg-primary"
-                        style={{ width: `${taskProgress ?? 0}%` }}
+                        className="relative h-1.5 w-20 animate-pulse overflow-hidden rounded-full bg-muted motion-reduce:animate-none"
+                        aria-hidden="true"
                       />
-                    </span>
+                    )}
                     <span>{t('sshFilesTool.activeTasks', { count: activeTasks.length })}</span>
                   </>
                 ) : (
@@ -2756,10 +2891,7 @@ export default function SshFilesTool({ active }: Props) {
         </div>
       </ToolLayoutFooter>
 
-      <Dialog
-        open={manageOpen}
-        onOpenChange={handleManageOpenChange}
-      >
+      <Dialog open={manageOpen} onOpenChange={handleManageOpenChange}>
         <DialogContent className="flex max-h-[min(720px,calc(100dvh-32px))] w-[min(560px,calc(100vw-32px))] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none">
           <DialogHeader className="flex-none border-b border-border px-6 py-5">
             {manageView === 'list' ? (
@@ -2826,9 +2958,7 @@ export default function SshFilesTool({ active }: Props) {
                   </TabsTrigger>
                   <TabsTrigger value="connection">
                     {t('sshFilesTool.connection')}
-                    <span className="text-[10px] text-muted-foreground">
-                      {connections.length}
-                    </span>
+                    <span className="text-[10px] text-muted-foreground">{connections.length}</span>
                   </TabsTrigger>
                 </TabsList>
 
@@ -3015,12 +3145,7 @@ export default function SshFilesTool({ active }: Props) {
                       <p className="m-0 max-w-xs text-[10px] leading-4 text-muted-foreground">
                         {t('sshFilesTool.noConnectionsHint')}
                       </p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="mt-2"
-                        onClick={newConnection}
-                      >
+                      <Button variant="outline" size="sm" className="mt-2" onClick={newConnection}>
                         <Plus data-icon="inline-start" size={14} />
                         {t('sshFilesTool.addConnection')}
                       </Button>
@@ -3029,355 +3154,358 @@ export default function SshFilesTool({ active }: Props) {
                 </TabsContent>
               </Tabs>
             ) : (
-            <section
-              className="min-h-0"
-              aria-label={
-                manageEditor === 'connection'
-                  ? t('sshFilesTool.connectionDetails')
-                  : t('sshFilesTool.fileSourceDetails')
-              }
-            >
-              {manageEditor === 'connection' ? (
-                <div className="mx-auto grid w-full max-w-[560px] content-start gap-5">
-                  <div className="grid gap-4">
-                    <div className="grid gap-1.5">
-                      <Label
-                        htmlFor="ssh-connection-name"
-                        className="text-xs text-muted-foreground"
-                      >
-                        {t('sshFilesTool.connectionName')}
-                      </Label>
-                      <Input
-                        id="ssh-connection-name"
-                        value={connectionDraft.name}
-                        onChange={(event) =>
-                          setConnectionDraft({ ...connectionDraft, name: event.target.value })
-                        }
-                      />
-                    </div>
-                    <div className="grid gap-1.5">
-                      <Label
-                        htmlFor="ssh-connection-mode"
-                        className="text-xs text-muted-foreground"
-                      >
-                        {t('sshFilesTool.connectionMode')}
-                      </Label>
-                      <Select
-                        items={[
-                          { value: 'local', label: t('sshFilesTool.localSSH') },
-                          { value: 'manual', label: t('sshFilesTool.manualSSH') },
-                        ]}
-                        value={connectionDraft.mode || 'manual'}
-                        onValueChange={(value) =>
-                          setConnectionDraft({ ...connectionDraft, mode: value || 'manual' })
-                        }
-                      >
-                        <SelectTrigger id="ssh-connection-mode" className="w-full">
-                          <SelectValue placeholder={t('sshFilesTool.connectionMode')} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="local">{t('sshFilesTool.localSSH')}</SelectItem>
-                          <SelectItem value="manual">{t('sshFilesTool.manualSSH')}</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    {connectionDraft.mode === 'local' ? (
-                      <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <p className="m-0 text-xs font-medium text-foreground">
-                              {t('sshFilesTool.localSSH')}
-                            </p>
-                            <p className="mt-1 m-0 text-[10px] leading-4 text-muted-foreground">
-                              {t('sshFilesTool.localSSHHint')}
-                            </p>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            className="h-7 w-7 flex-none"
-                            onClick={refreshSSHHosts}
-                            disabled={sshHostsLoading}
-                            aria-label={t('sshFilesTool.refreshSSHHosts')}
-                          >
-                            <ArrowClockwise
-                              size={14}
-                              className={
-                                sshHostsLoading ? 'animate-spin motion-reduce:animate-none' : ''
-                              }
-                            />
-                          </Button>
-                        </div>
-                        {sshHostsLoading ? (
-                          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                            <Spinner className="size-3" />
-                            {t('common.loading')}
-                          </div>
-                        ) : sshHostsError ? (
-                          <div className="grid gap-2" role="alert">
-                            <p className="m-0 text-xs text-destructive">
-                              {t('sshFilesTool.sshHostsFailed')}
-                            </p>
-                            <p className="m-0 break-words text-[10px] leading-4 text-muted-foreground">
-                              {sshHostsError}
-                            </p>
+              <section
+                className="min-h-0"
+                aria-label={
+                  manageEditor === 'connection'
+                    ? t('sshFilesTool.connectionDetails')
+                    : t('sshFilesTool.fileSourceDetails')
+                }
+              >
+                {manageEditor === 'connection' ? (
+                  <div className="mx-auto grid w-full max-w-[560px] content-start gap-5">
+                    <div className="grid gap-4">
+                      <div className="grid gap-1.5">
+                        <Label
+                          htmlFor="ssh-connection-name"
+                          className="text-xs text-muted-foreground"
+                        >
+                          {t('sshFilesTool.connectionName')}
+                        </Label>
+                        <Input
+                          id="ssh-connection-name"
+                          value={connectionDraft.name}
+                          onChange={(event) =>
+                            setConnectionDraft({ ...connectionDraft, name: event.target.value })
+                          }
+                        />
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label
+                          htmlFor="ssh-connection-mode"
+                          className="text-xs text-muted-foreground"
+                        >
+                          {t('sshFilesTool.connectionMode')}
+                        </Label>
+                        <Select
+                          items={[
+                            { value: 'local', label: t('sshFilesTool.localSSH') },
+                            { value: 'manual', label: t('sshFilesTool.manualSSH') },
+                          ]}
+                          value={connectionDraft.mode || 'manual'}
+                          onValueChange={(value) =>
+                            setConnectionDraft({ ...connectionDraft, mode: value || 'manual' })
+                          }
+                        >
+                          <SelectTrigger id="ssh-connection-mode" className="w-full">
+                            <SelectValue placeholder={t('sshFilesTool.connectionMode')} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="local">{t('sshFilesTool.localSSH')}</SelectItem>
+                            <SelectItem value="manual">{t('sshFilesTool.manualSSH')}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {connectionDraft.mode === 'local' ? (
+                        <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="m-0 text-xs font-medium text-foreground">
+                                {t('sshFilesTool.localSSH')}
+                              </p>
+                              <p className="mt-1 m-0 text-[10px] leading-4 text-muted-foreground">
+                                {t('sshFilesTool.localSSHHint')}
+                              </p>
+                            </div>
                             <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-7 w-fit px-2 text-[11px]"
+                              variant="ghost"
+                              size="icon-sm"
+                              className="h-7 w-7 flex-none"
                               onClick={refreshSSHHosts}
+                              disabled={sshHostsLoading}
+                              aria-label={t('sshFilesTool.refreshSSHHosts')}
                             >
-                              <ArrowClockwise data-icon="inline-start" size={13} />
-                              {t('sshFilesTool.refresh')}
+                              <ArrowClockwise
+                                size={14}
+                                className={
+                                  sshHostsLoading ? 'animate-spin motion-reduce:animate-none' : ''
+                                }
+                              />
                             </Button>
                           </div>
-                        ) : sshHosts.length ? (
+                          {sshHostsLoading ? (
+                            <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                              <Spinner className="size-3" />
+                              {t('common.loading')}
+                            </div>
+                          ) : sshHostsError ? (
+                            <div className="grid gap-2" role="alert">
+                              <p className="m-0 text-xs text-destructive">
+                                {t('sshFilesTool.sshHostsFailed')}
+                              </p>
+                              <p className="m-0 break-words text-[10px] leading-4 text-muted-foreground">
+                                {sshHostsError}
+                              </p>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 w-fit px-2 text-[11px]"
+                                onClick={refreshSSHHosts}
+                              >
+                                <ArrowClockwise data-icon="inline-start" size={13} />
+                                {t('sshFilesTool.refresh')}
+                              </Button>
+                            </div>
+                          ) : sshHosts.length ? (
+                            <div className="grid gap-1.5">
+                              <Label
+                                htmlFor="ssh-connection-host"
+                                className="text-xs text-muted-foreground"
+                              >
+                                {t('sshFilesTool.selectSSHHost')}
+                              </Label>
+                              <Select
+                                items={sshHosts.map((host) => ({ value: host, label: host }))}
+                                value={connectionDraft.alias || null}
+                                onValueChange={(value) =>
+                                  setConnectionDraft({ ...connectionDraft, alias: value || '' })
+                                }
+                              >
+                                <SelectTrigger id="ssh-connection-host" className="w-full">
+                                  <SelectValue placeholder={t('sshFilesTool.selectSSHHost')} />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {sshHosts.map((host) => (
+                                    <SelectItem key={host} value={host}>
+                                      {host}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          ) : (
+                            <div className="rounded-md border border-dashed border-border px-3 py-2">
+                              <p className="m-0 text-xs font-medium text-foreground">
+                                {t('sshFilesTool.sshHostsEmpty')}
+                              </p>
+                              <p className="mt-1 m-0 text-[10px] leading-4 text-muted-foreground">
+                                {t('sshFilesTool.sshHostsEmptyHint')}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="grid gap-4">
+                          <p className="m-0 text-[11px] leading-4 text-muted-foreground">
+                            {t('sshFilesTool.manualSSHHint')}
+                          </p>
+                          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_112px]">
+                            <div className="grid gap-1.5">
+                              <Label
+                                htmlFor="ssh-connection-host-manual"
+                                className="text-xs text-muted-foreground"
+                              >
+                                {t('sshFilesTool.host')}
+                              </Label>
+                              <Input
+                                id="ssh-connection-host-manual"
+                                value={connectionDraft.host}
+                                onChange={(event) =>
+                                  setConnectionDraft({
+                                    ...connectionDraft,
+                                    host: event.target.value,
+                                  })
+                                }
+                              />
+                            </div>
+                            <div className="grid gap-1.5">
+                              <Label
+                                htmlFor="ssh-connection-port"
+                                className="text-xs text-muted-foreground"
+                              >
+                                {t('sshFilesTool.port')}
+                              </Label>
+                              <Input
+                                id="ssh-connection-port"
+                                type="number"
+                                min={1}
+                                max={65535}
+                                value={connectionDraft.port}
+                                onChange={(event) =>
+                                  setConnectionDraft({
+                                    ...connectionDraft,
+                                    port: Number(event.target.value),
+                                  })
+                                }
+                              />
+                            </div>
+                          </div>
                           <div className="grid gap-1.5">
                             <Label
-                              htmlFor="ssh-connection-host"
+                              htmlFor="ssh-connection-username"
                               className="text-xs text-muted-foreground"
                             >
-                              {t('sshFilesTool.selectSSHHost')}
-                            </Label>
-                            <Select
-                              items={sshHosts.map((host) => ({ value: host, label: host }))}
-                              value={connectionDraft.alias || null}
-                              onValueChange={(value) =>
-                                setConnectionDraft({ ...connectionDraft, alias: value || '' })
-                              }
-                            >
-                              <SelectTrigger id="ssh-connection-host" className="w-full">
-                                <SelectValue placeholder={t('sshFilesTool.selectSSHHost')} />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {sshHosts.map((host) => (
-                                  <SelectItem key={host} value={host}>
-                                    {host}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        ) : (
-                          <div className="rounded-md border border-dashed border-border px-3 py-2">
-                            <p className="m-0 text-xs font-medium text-foreground">
-                              {t('sshFilesTool.sshHostsEmpty')}
-                            </p>
-                            <p className="mt-1 m-0 text-[10px] leading-4 text-muted-foreground">
-                              {t('sshFilesTool.sshHostsEmptyHint')}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="grid gap-4">
-                        <p className="m-0 text-[11px] leading-4 text-muted-foreground">
-                          {t('sshFilesTool.manualSSHHint')}
-                        </p>
-                        <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_112px]">
-                          <div className="grid gap-1.5">
-                            <Label
-                              htmlFor="ssh-connection-host-manual"
-                              className="text-xs text-muted-foreground"
-                            >
-                              {t('sshFilesTool.host')}
+                              {t('sshFilesTool.username')}
                             </Label>
                             <Input
-                              id="ssh-connection-host-manual"
-                              value={connectionDraft.host}
-                              onChange={(event) =>
-                                setConnectionDraft({ ...connectionDraft, host: event.target.value })
-                              }
-                            />
-                          </div>
-                          <div className="grid gap-1.5">
-                            <Label
-                              htmlFor="ssh-connection-port"
-                              className="text-xs text-muted-foreground"
-                            >
-                              {t('sshFilesTool.port')}
-                            </Label>
-                            <Input
-                              id="ssh-connection-port"
-                              type="number"
-                              min={1}
-                              max={65535}
-                              value={connectionDraft.port}
+                              id="ssh-connection-username"
+                              value={connectionDraft.username}
                               onChange={(event) =>
                                 setConnectionDraft({
                                   ...connectionDraft,
-                                  port: Number(event.target.value),
+                                  username: event.target.value,
                                 })
                               }
                             />
                           </div>
-                        </div>
-                        <div className="grid gap-1.5">
-                          <Label
-                            htmlFor="ssh-connection-username"
-                            className="text-xs text-muted-foreground"
-                          >
-                            {t('sshFilesTool.username')}
-                          </Label>
-                          <Input
-                            id="ssh-connection-username"
-                            value={connectionDraft.username}
-                            onChange={(event) =>
-                              setConnectionDraft({
-                                ...connectionDraft,
-                                username: event.target.value,
-                              })
-                            }
-                          />
-                        </div>
-                        <div className="grid gap-4 sm:grid-cols-2">
+                          <div className="grid gap-4 sm:grid-cols-2">
+                            <div className="grid gap-1.5">
+                              <Label
+                                htmlFor="ssh-connection-password"
+                                className="text-xs text-muted-foreground"
+                              >
+                                {t('sshFilesTool.password')}
+                              </Label>
+                              <Input
+                                id="ssh-connection-password"
+                                type="password"
+                                value={connectionDraft.password}
+                                onChange={(event) =>
+                                  setConnectionDraft({
+                                    ...connectionDraft,
+                                    password: event.target.value,
+                                  })
+                                }
+                              />
+                            </div>
+                            <div className="grid gap-1.5">
+                              <Label
+                                htmlFor="ssh-connection-key-path"
+                                className="text-xs text-muted-foreground"
+                              >
+                                {t('sshFilesTool.privateKeyPath')}
+                              </Label>
+                              <Input
+                                id="ssh-connection-key-path"
+                                value={connectionDraft.privateKeyPath}
+                                onChange={(event) =>
+                                  setConnectionDraft({
+                                    ...connectionDraft,
+                                    privateKeyPath: event.target.value,
+                                  })
+                                }
+                              />
+                            </div>
+                          </div>
                           <div className="grid gap-1.5">
                             <Label
-                              htmlFor="ssh-connection-password"
+                              htmlFor="ssh-connection-key-passphrase"
                               className="text-xs text-muted-foreground"
                             >
-                              {t('sshFilesTool.password')}
+                              {t('sshFilesTool.keyPassphrase')}
                             </Label>
                             <Input
-                              id="ssh-connection-password"
+                              id="ssh-connection-key-passphrase"
                               type="password"
-                              value={connectionDraft.password}
+                              value={connectionDraft.keyPassphrase}
                               onChange={(event) =>
                                 setConnectionDraft({
                                   ...connectionDraft,
-                                  password: event.target.value,
-                                })
-                              }
-                            />
-                          </div>
-                          <div className="grid gap-1.5">
-                            <Label
-                              htmlFor="ssh-connection-key-path"
-                              className="text-xs text-muted-foreground"
-                            >
-                              {t('sshFilesTool.privateKeyPath')}
-                            </Label>
-                            <Input
-                              id="ssh-connection-key-path"
-                              value={connectionDraft.privateKeyPath}
-                              onChange={(event) =>
-                                setConnectionDraft({
-                                  ...connectionDraft,
-                                  privateKeyPath: event.target.value,
+                                  keyPassphrase: event.target.value,
                                 })
                               }
                             />
                           </div>
                         </div>
-                        <div className="grid gap-1.5">
-                          <Label
-                            htmlFor="ssh-connection-key-passphrase"
-                            className="text-xs text-muted-foreground"
-                          >
-                            {t('sshFilesTool.keyPassphrase')}
-                          </Label>
-                          <Input
-                            id="ssh-connection-key-passphrase"
-                            type="password"
-                            value={connectionDraft.keyPassphrase}
-                            onChange={(event) =>
-                              setConnectionDraft({
-                                ...connectionDraft,
-                                keyPassphrase: event.target.value,
-                              })
-                            }
-                          />
-                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
+                      <Button
+                        variant="outline"
+                        onClick={() => void testConnection()}
+                        disabled={
+                          savingManage ||
+                          testingConnection ||
+                          (connectionDraft.mode === 'local'
+                            ? !connectionDraft.alias
+                            : !connectionDraft.host || !connectionDraft.username)
+                        }
+                      >
+                        {testingConnection ? <Spinner data-icon="inline-start" /> : null}
+                        {t('sshFilesTool.testConnection')}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mx-auto grid w-full max-w-[560px] content-start gap-5">
+                    <div className="grid gap-4">
+                      <div className="grid gap-1.5">
+                        <Label htmlFor="ssh-source-name" className="text-xs text-muted-foreground">
+                          {t('sshFilesTool.sourceName')}
+                        </Label>
+                        <Input
+                          id="ssh-source-name"
+                          value={sourceDraft.name}
+                          onChange={(event) =>
+                            setSourceDraft({ ...sourceDraft, name: event.target.value })
+                          }
+                        />
                       </div>
-                    )}
-                  </div>
-                  <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
-                    <Button
-                      variant="outline"
-                      onClick={() => void testConnection()}
-                      disabled={
-                        savingManage ||
-                        testingConnection ||
-                        (connectionDraft.mode === 'local'
-                          ? !connectionDraft.alias
-                          : !connectionDraft.host || !connectionDraft.username)
-                      }
-                    >
-                      {testingConnection ? <Spinner data-icon="inline-start" /> : null}
-                      {t('sshFilesTool.testConnection')}
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <div className="mx-auto grid w-full max-w-[560px] content-start gap-5">
-                  <div className="grid gap-4">
-                    <div className="grid gap-1.5">
-                      <Label htmlFor="ssh-source-name" className="text-xs text-muted-foreground">
-                        {t('sshFilesTool.sourceName')}
-                      </Label>
-                      <Input
-                        id="ssh-source-name"
-                        value={sourceDraft.name}
-                        onChange={(event) =>
-                          setSourceDraft({ ...sourceDraft, name: event.target.value })
-                        }
-                      />
-                    </div>
-                    <div className="grid gap-1.5">
-                      <Label
-                        htmlFor="ssh-source-connection"
-                        className="text-xs text-muted-foreground"
-                      >
-                        {t('sshFilesTool.selectConnection')}
-                      </Label>
-                      <Select
-                        items={availableConnections.map((item) => ({
-                          value: item.id,
-                          label: item.name,
-                        }))}
-                        value={sourceDraft.sshConnectionID || null}
-                        onValueChange={(value) =>
-                          setSourceDraft({
-                            ...sourceDraft,
-                            sshConnectionID: value || '',
-                          })
-                        }
-                      >
-                        <SelectTrigger id="ssh-source-connection" className="w-full">
-                          <SelectValue placeholder={t('sshFilesTool.selectConnection')} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {availableConnections.map((item) => (
-                            <SelectItem key={item.id} value={item.id}>
-                              {item.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="grid gap-1.5">
-                      <Label
-                        htmlFor="ssh-source-default-path"
-                        className="text-xs text-muted-foreground"
-                      >
-                        {t('sshFilesTool.defaultPath')}
-                      </Label>
-                      <Input
-                        id="ssh-source-default-path"
-                        value={sourceDraft.defaultPath}
-                        onChange={(event) =>
-                          setSourceDraft({ ...sourceDraft, defaultPath: event.target.value })
-                        }
-                        className="font-mono text-xs"
-                      />
-                      <p className="m-0 text-[10px] leading-4 text-muted-foreground">
-                        {t('sshFilesTool.sourceHint')}
-                      </p>
+                      <div className="grid gap-1.5">
+                        <Label
+                          htmlFor="ssh-source-connection"
+                          className="text-xs text-muted-foreground"
+                        >
+                          {t('sshFilesTool.selectConnection')}
+                        </Label>
+                        <Select
+                          items={availableConnections.map((item) => ({
+                            value: item.id,
+                            label: item.name,
+                          }))}
+                          value={sourceDraft.sshConnectionID || null}
+                          onValueChange={(value) =>
+                            setSourceDraft({
+                              ...sourceDraft,
+                              sshConnectionID: value || '',
+                            })
+                          }
+                        >
+                          <SelectTrigger id="ssh-source-connection" className="w-full">
+                            <SelectValue placeholder={t('sshFilesTool.selectConnection')} />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {availableConnections.map((item) => (
+                              <SelectItem key={item.id} value={item.id}>
+                                {item.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="grid gap-1.5">
+                        <Label
+                          htmlFor="ssh-source-default-path"
+                          className="text-xs text-muted-foreground"
+                        >
+                          {t('sshFilesTool.defaultPath')}
+                        </Label>
+                        <Input
+                          id="ssh-source-default-path"
+                          value={sourceDraft.defaultPath}
+                          onChange={(event) =>
+                            setSourceDraft({ ...sourceDraft, defaultPath: event.target.value })
+                          }
+                          className="font-mono text-xs"
+                        />
+                        <p className="m-0 text-[10px] leading-4 text-muted-foreground">
+                          {t('sshFilesTool.sourceHint')}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
-            </section>
+                )}
+              </section>
             )}
           </div>
           <DialogFooter className="mx-0 mb-0 flex-none rounded-b-xl px-6 py-4">
@@ -3394,9 +3522,7 @@ export default function SshFilesTool({ active }: Props) {
               <Button
                 disabled={savingManage || testingConnection}
                 onClick={() =>
-                  manageCollectionDirty
-                    ? void saveManage()
-                    : handleManageOpenChange(false)
+                  manageCollectionDirty ? void saveManage() : handleManageOpenChange(false)
                 }
               >
                 {manageCollectionDirty ? t('common.save') : t('common.done')}
@@ -3430,12 +3556,12 @@ export default function SshFilesTool({ active }: Props) {
                 ? t('sshFilesTool.removeConnectionTitle')
                 : manageConfirm?.type === 'removeSource'
                   ? t('sshFilesTool.removeSourceTitle')
-                : manageConfirm?.type === 'discardManage' ||
+                  : manageConfirm?.type === 'discardManage' ||
                       manageConfirm?.type === 'discardAndCreate'
                     ? t('sshFilesTool.discardManageTitle')
                     : manageConfirm?.type === 'discardNavigate'
                       ? t('sshFilesTool.discardEditTitle')
-                    : t('sshFilesTool.discardDraftTitle')}
+                      : t('sshFilesTool.discardDraftTitle')}
             </AlertDialogTitle>
             <AlertDialogDescription className="text-xs leading-5">
               {manageConfirm?.type === 'removeConnection'
@@ -3446,12 +3572,12 @@ export default function SshFilesTool({ active }: Props) {
                   : t('sshFilesTool.removeConnectionNoSourcesConfirm')
                 : manageConfirm?.type === 'removeSource'
                   ? t('sshFilesTool.removeSourceConfirm', { name: manageConfirm.source.name })
-                : manageConfirm?.type === 'discardManage' ||
+                  : manageConfirm?.type === 'discardManage' ||
                       manageConfirm?.type === 'discardAndCreate'
                     ? t('sshFilesTool.discardManageConfirm')
                     : manageConfirm?.type === 'discardNavigate'
                       ? t('sshFilesTool.discardEditConfirm')
-                    : t('sshFilesTool.discardDraftConfirm')}
+                      : t('sshFilesTool.discardDraftConfirm')}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -3468,12 +3594,12 @@ export default function SshFilesTool({ active }: Props) {
                 ? t('sshFilesTool.removeConnectionAction')
                 : manageConfirm?.type === 'removeSource'
                   ? t('sshFilesTool.removeSourceAction')
-                : manageConfirm?.type === 'discardManage' ||
+                  : manageConfirm?.type === 'discardManage' ||
                       manageConfirm?.type === 'discardAndCreate'
                     ? t('sshFilesTool.discardManageAction')
                     : manageConfirm?.type === 'discardNavigate'
                       ? t('sshFilesTool.discardEditAction')
-                    : t('sshFilesTool.discardDraftAction')}
+                      : t('sshFilesTool.discardDraftAction')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -3494,9 +3620,7 @@ export default function SshFilesTool({ active }: Props) {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={favoritesSaving}>
-              {t('common.cancel')}
-            </AlertDialogCancel>
+            <AlertDialogCancel disabled={favoritesSaving}>{t('common.cancel')}</AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={favoritesSaving}
@@ -3604,9 +3728,7 @@ export default function SshFilesTool({ active }: Props) {
               {t('common.cancel')}
             </Button>
             <Button
-              disabled={
-                uploadStarting || !sourceID || uploadPaths.length === 0 || !allowOverwrite
-              }
+              disabled={uploadStarting || !sourceID || uploadPaths.length === 0 || !allowOverwrite}
               onClick={() => void confirmUpload()}
             >
               {uploadStarting ? (
@@ -3752,7 +3874,10 @@ export default function SshFilesTool({ active }: Props) {
             >
               {t('common.cancel')}
             </Button>
-            <Button disabled={operationRunning || operationDialog === null} onClick={() => void executeOperationDialog()}>
+            <Button
+              disabled={operationRunning || operationDialog === null}
+              onClick={() => void executeOperationDialog()}
+            >
               {operationRunning ? (
                 <Spinner data-icon="inline-start" />
               ) : (
@@ -3772,10 +3897,7 @@ export default function SshFilesTool({ active }: Props) {
         <AlertDialogContent className="min-w-0 max-w-[calc(100vw-32px)] sm:max-w-md">
           <AlertDialogHeader>
             <AlertDialogTitle>{t('sshFilesTool.operationConflictTitle')}</AlertDialogTitle>
-            <AlertDialogDescription
-              render={<div />}
-              className="grid gap-2 text-xs leading-5"
-            >
+            <AlertDialogDescription render={<div />} className="grid gap-2 text-xs leading-5">
               <p className="m-0">
                 {t('sshFilesTool.operationConflictDesc', {
                   count: operationConflict?.conflicts.length ?? 0,
@@ -3883,9 +4005,7 @@ export default function SshFilesTool({ active }: Props) {
                     .slice()
                     .reverse()
                     .map((task) => {
-                      const percent = taskPercent(task);
                       const running = ['queued', 'running', 'scanning'].includes(task.status);
-                      const progressWidth = percent ?? (task.status === 'success' ? 100 : 0);
                       return (
                         <div
                           key={task.id}
@@ -3923,41 +4043,7 @@ export default function SshFilesTool({ active }: Props) {
                                 {task.current || task.target || '—'}
                               </span>
                             </div>
-                            <div className="mt-2 flex items-center gap-2">
-                              <div
-                                className={`h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted ${percent === null && running ? 'animate-pulse motion-reduce:animate-none' : ''}`}
-                                role="progressbar"
-                                aria-valuemin={0}
-                                aria-valuemax={100}
-                                aria-valuenow={percent ?? undefined}
-                                aria-valuetext={taskStatusLabel(task.status, t)}
-                              >
-                                <div
-                                  className={`h-full rounded-full ${task.status === 'success' ? 'bg-success' : task.status === 'failed' ? 'bg-destructive' : 'bg-primary'}`}
-                                  style={{ width: `${progressWidth}%` }}
-                                />
-                              </div>
-                              <span className="flex-none font-mono text-[10px] text-muted-foreground">
-                                {task.type === 'extract' && task.total <= 0
-                                  ? t('sshFilesTool.taskExtractedUnknown', {
-                                      completed: formatBytes(task.completed),
-                                    })
-                                  : taskUsesByteProgress(task)
-                                  ? t('sshFilesTool.taskBytes', {
-                                      completed: formatBytes(task.completed),
-                                      total: task.total ? formatBytes(task.total) : '—',
-                                    })
-                                  : task.files > 0
-                                  ? t('sshFilesTool.taskFiles', {
-                                      done: task.doneFiles,
-                                      total: task.files,
-                                    })
-                                  : t('sshFilesTool.taskBytes', {
-                                      completed: formatBytes(task.completed),
-                                      total: task.total ? formatBytes(task.total) : '—',
-                                    })}
-                              </span>
-                            </div>
+                            <TaskProgressMeter task={task} />
                             {task.error ? (
                               <div
                                 className="mt-1 break-all text-[10px] text-destructive"
