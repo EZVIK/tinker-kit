@@ -206,6 +206,29 @@ func TestRemoteArchiveCommandsQuotePaths(t *testing.T) {
 	if got, want := remoteArchiveExtractCommand("tar.gz", archivePath, target), `tar -xzf '/remote/O'"'"'Brien.tar.gz' -C '/target/O'"'"'Brien'`; got != want {
 		t.Fatalf("远程解压命令 = %q, want %q", got, want)
 	}
+	compressCommand := remoteArchiveCompressCommand("tar.gz", []string{"/remote/O'Brien"}, archivePath)
+	for _, expected := range []string{
+		"command -v tar >/dev/null 2>&1",
+		"tar -czf '/remote/O'\"'\"'Brien.tar.gz' -C '/remote' 'O'\"'\"'Brien'",
+	} {
+		if !strings.Contains(compressCommand, expected) {
+			t.Fatalf("远程压缩命令缺少 %q: %s", expected, compressCommand)
+		}
+	}
+	zipCommand := remoteArchiveCompressCommand(
+		"zip",
+		[]string{"/remote/O'Brien", "/other/archive"},
+		"/target/archive.zip",
+	)
+	for _, expected := range []string{
+		"command -v zip >/dev/null 2>&1",
+		"(cd '/remote' && zip -qr '/target/archive.zip' 'O'\"'\"'Brien')",
+		"(cd '/other' && zip -qr -g '/target/archive.zip' 'archive')",
+	} {
+		if !strings.Contains(zipCommand, expected) {
+			t.Fatalf("远程 ZIP 压缩命令缺少 %q: %s", expected, zipCommand)
+		}
+	}
 	probe := remoteArchiveProbeCommand("tar.gz", archivePath)
 	if !strings.Contains(probe, "tar --numeric-owner -tvzf '/remote/O'\"'\"'Brien.tar.gz'") {
 		t.Fatalf("远程解压探测命令未正确引用压缩包路径: %q", probe)

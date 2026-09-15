@@ -1,10 +1,7 @@
 package main
 
 import (
-	"archive/tar"
-	"archive/zip"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -501,6 +498,66 @@ func remoteArchiveExtractCommand(format, remotePath, target string) string {
 		return "tar -xzf " + quotedPath + " -C " + quotedTarget
 	case "zip":
 		return "unzip -oq " + quotedPath + " -d " + quotedTarget
+	default:
+		return ""
+	}
+}
+
+func remoteArchiveMemberName(remotePath string) string {
+	name := path.Base(remotePath)
+	if strings.HasPrefix(name, "-") {
+		return "./" + name
+	}
+	return name
+}
+
+func remoteArchiveCompressCommand(format string, remotePaths []string, target string) string {
+	if len(remotePaths) == 0 {
+		return ""
+	}
+	switch format {
+	case "tar", "tar.gz":
+		flag := "-cf"
+		if format == "tar.gz" {
+			flag = "-czf"
+		}
+		command := "command -v tar >/dev/null 2>&1 || exit 127; tar " + flag + " " + shellQuote(target)
+		for _, remotePath := range remotePaths {
+			command += " -C " + shellQuote(path.Dir(remotePath)) +
+				" " + shellQuote(remoteArchiveMemberName(remotePath))
+		}
+		return command
+	case "zip":
+		type zipSourceGroup struct {
+			parent string
+			names  []string
+		}
+		groups := make([]zipSourceGroup, 0, len(remotePaths))
+		for _, remotePath := range remotePaths {
+			parent := path.Dir(remotePath)
+			name := remoteArchiveMemberName(remotePath)
+			if len(groups) > 0 && groups[len(groups)-1].parent == parent {
+				groups[len(groups)-1].names = append(groups[len(groups)-1].names, name)
+				continue
+			}
+			groups = append(groups, zipSourceGroup{parent: parent, names: []string{name}})
+		}
+		command := "command -v zip >/dev/null 2>&1 || exit 127; "
+		for index, group := range groups {
+			if index > 0 {
+				command += " && "
+			}
+			command += "(cd " + shellQuote(group.parent) + " && zip -qr "
+			if index > 0 {
+				command += "-g "
+			}
+			command += shellQuote(target)
+			for _, name := range group.names {
+				command += " " + shellQuote(name)
+			}
+			command += ")"
+		}
+		return command
 	default:
 		return ""
 	}
@@ -1462,25 +1519,19 @@ func (s *FileService) operateRemoteFiles(
 				return result, fmt.Errorf("压缩目标不能位于待压缩目录中: %s", target)
 			}
 		}
-		stats, err := collectRemoteArchiveStats(ctx, client, paths)
+		_, err := collectRemoteArchiveStats(ctx, client, paths)
 		if err != nil {
 			return result, fmt.Errorf("统计待压缩项目失败: %w", err)
 		}
-		if onProgress != nil {
-			onProgress(remoteFileOperationProgress{
-				total:      stats.total,
-				totalKnown: true,
-				files:      stats.files,
-				current:    target,
-			})
-		}
-		if err := createRemoteArchive(
+		format := remoteArchiveFormatForPath(target)
+		if _, err := runRemoteArchiveCompression(
 			ctx,
+			conn,
+			sshClient,
 			client,
+			format,
 			paths,
 			target,
-			stats.total,
-			stats.files,
 			onProgress,
 		); err != nil {
 			return result, fmt.Errorf("压缩远程项目失败: %w", err)
@@ -1881,6 +1932,77 @@ type remoteArchiveExtractionResult struct {
 	totalKnown bool
 }
 
+func runRemoteArchiveCompression(
+	ctx context.Context,
+	conn SSHConnection,
+	sshClient *ssh.Client,
+	client *sftp.Client,
+	format string,
+	remotePaths []string,
+	target string,
+	onProgress func(remoteFileOperationProgress),
+) (int64, error) {
+	// 归档由远端 tar/zip 直接生成，本地只通过 SFTP 读取目标文件大小。
+	command := remoteArchiveCompressCommand(format, remotePaths, target)
+	if command == "" {
+		return 0, errors.New("压缩文件格式不受支持")
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runRemoteCommand(ctx, conn, sshClient, command)
+	}()
+	ticker := time.NewTicker(remoteArchiveProgressPollInterval)
+	defer ticker.Stop()
+	var lastCompleted int64
+	report := func() {
+		info, err := client.Lstat(target)
+		if err != nil || !info.Mode().IsRegular() {
+			return
+		}
+		completed := info.Size()
+		if completed < lastCompleted {
+			completed = lastCompleted
+		}
+		lastCompleted = completed
+		if onProgress == nil {
+			return
+		}
+		onProgress(remoteFileOperationProgress{
+			completed:  completed,
+			current:    target,
+			totalKnown: false,
+		})
+	}
+	// 压缩总大小取决于压缩率，运行期间只能报告远端已生成的归档字节数。
+	report()
+	for {
+		select {
+		case err := <-done:
+			report()
+			if err != nil {
+				_ = client.Remove(target)
+				return lastCompleted, err
+			}
+			if onProgress != nil {
+				onProgress(remoteFileOperationProgress{
+					completed:  lastCompleted,
+					total:      lastCompleted,
+					totalKnown: true,
+					current:    target,
+				})
+			}
+			return lastCompleted, nil
+		case <-ticker.C:
+			report()
+		case <-ctx.Done():
+			if err := <-done; err != nil {
+				_ = client.Remove(target)
+			}
+			return lastCompleted, ctx.Err()
+		}
+	}
+}
+
 func runRemoteArchiveExtraction(
 	ctx context.Context,
 	conn SSHConnection,
@@ -2006,332 +2128,6 @@ func remoteArchiveFormatForPath(remotePath string) string {
 	default:
 		return ""
 	}
-}
-
-func archiveEntryName(value string) string {
-	value = strings.ReplaceAll(value, "\\", "/")
-	value = path.Clean(value)
-	if value == "." {
-		return ""
-	}
-	return strings.TrimPrefix(value, "./")
-}
-
-func writeRemoteFileToArchive(
-	ctx context.Context,
-	client *sftp.Client,
-	remotePath string,
-	dst io.Writer,
-	onBytes func(int64, string),
-	onFileComplete func(string),
-) error {
-	input, err := client.Open(remotePath)
-	if err != nil {
-		return err
-	}
-	copyErr := copyWithProgress(ctx, dst, input, func(delta int64) {
-		if onBytes != nil {
-			onBytes(delta, remotePath)
-		}
-	})
-	closeErr := input.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if onFileComplete != nil {
-		onFileComplete(remotePath)
-	}
-	return nil
-}
-
-func addRemoteToTar(
-	ctx context.Context,
-	client *sftp.Client,
-	remotePath, relativePath string,
-	writer *tar.Writer,
-	onBytes func(int64, string),
-	onFileComplete func(string),
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	info, err := client.Lstat(remotePath)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("不支持压缩符号链接: %s", remotePath)
-	}
-	name := archiveEntryName(relativePath)
-	if name == "" {
-		return errors.New("压缩项目名称无效")
-	}
-	header, err := tar.FileInfoHeader(info, "")
-	if err != nil {
-		return err
-	}
-	header.Name = name
-	if info.IsDir() && !strings.HasSuffix(header.Name, "/") {
-		header.Name += "/"
-	}
-	if err := writer.WriteHeader(header); err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return writeRemoteFileToArchive(ctx, client, remotePath, writer, onBytes, onFileComplete)
-	}
-	entries, err := client.ReadDir(remotePath)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := addRemoteToTar(
-			ctx,
-			client,
-			remoteChild(remotePath, entry.Name()),
-			path.Join(name, entry.Name()),
-			writer,
-			onBytes,
-			onFileComplete,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func addRemoteToZip(
-	ctx context.Context,
-	client *sftp.Client,
-	remotePath, relativePath string,
-	writer *zip.Writer,
-	onBytes func(int64, string),
-	onFileComplete func(string),
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	info, err := client.Lstat(remotePath)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("不支持压缩符号链接: %s", remotePath)
-	}
-	name := archiveEntryName(relativePath)
-	if name == "" {
-		return errors.New("压缩项目名称无效")
-	}
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-	header.Name = name
-	if info.IsDir() && !strings.HasSuffix(header.Name, "/") {
-		header.Name += "/"
-	}
-	header.SetMode(info.Mode())
-	entry, err := writer.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return writeRemoteFileToArchive(ctx, client, remotePath, entry, onBytes, onFileComplete)
-	}
-	entries, err := client.ReadDir(remotePath)
-	if err != nil {
-		return err
-	}
-	for _, child := range entries {
-		if err := addRemoteToZip(
-			ctx,
-			client,
-			remoteChild(remotePath, child.Name()),
-			path.Join(name, child.Name()),
-			writer,
-			onBytes,
-			onFileComplete,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func uploadLocalFileToRemote(
-	ctx context.Context,
-	client *sftp.Client,
-	localPath, remotePath string,
-	onBytes func(int64),
-) error {
-	input, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	output, err := client.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
-	if err != nil {
-		_ = input.Close()
-		return err
-	}
-	copyErr := copyWithProgress(ctx, output, input, onBytes)
-	outputErr := output.Close()
-	inputErr := input.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if outputErr != nil {
-		return outputErr
-	}
-	return inputErr
-}
-
-func createRemoteArchive(
-	ctx context.Context,
-	client *sftp.Client,
-	remotePaths []string,
-	target string,
-	sourceTotal int64,
-	sourceFiles int,
-	onProgress func(remoteFileOperationProgress),
-) error {
-	format := remoteArchiveFormatForPath(target)
-	if format == "" {
-		return errors.New("压缩文件格式不受支持")
-	}
-	archiveFile, err := os.CreateTemp("", "tinkerkit-ssh-compress-*")
-	if err != nil {
-		return err
-	}
-	localPath := archiveFile.Name()
-	defer os.Remove(localPath)
-	defer archiveFile.Close()
-
-	sourceCompleted, doneFiles := int64(0), 0
-	report := func(completed int64, current string) {
-		if onProgress != nil {
-			onProgress(remoteFileOperationProgress{
-				completed:  completed,
-				total:      sourceTotal,
-				totalKnown: true,
-				files:      sourceFiles,
-				doneFiles:  doneFiles,
-				current:    current,
-			})
-		}
-	}
-	onBytes := func(delta int64, current string) {
-		sourceCompleted += delta
-		report(sourceCompleted, current)
-	}
-	onFileComplete := func(current string) {
-		doneFiles++
-		report(sourceCompleted, current)
-	}
-
-	var archiveErr error
-	switch format {
-	case "zip":
-		writer := zip.NewWriter(archiveFile)
-		for _, remotePath := range remotePaths {
-			if archiveErr != nil {
-				break
-			}
-			archiveErr = addRemoteToZip(
-				ctx,
-				client,
-				remotePath,
-				path.Base(remotePath),
-				writer,
-				onBytes,
-				onFileComplete,
-			)
-		}
-		closeErr := writer.Close()
-		if archiveErr == nil {
-			archiveErr = closeErr
-		}
-	case "tar":
-		writer := tar.NewWriter(archiveFile)
-		for _, remotePath := range remotePaths {
-			if archiveErr != nil {
-				break
-			}
-			archiveErr = addRemoteToTar(
-				ctx,
-				client,
-				remotePath,
-				path.Base(remotePath),
-				writer,
-				onBytes,
-				onFileComplete,
-			)
-		}
-		closeErr := writer.Close()
-		if archiveErr == nil {
-			archiveErr = closeErr
-		}
-	case "tar.gz":
-		gzipWriter := gzip.NewWriter(archiveFile)
-		tarWriter := tar.NewWriter(gzipWriter)
-		for _, remotePath := range remotePaths {
-			if archiveErr != nil {
-				break
-			}
-			archiveErr = addRemoteToTar(
-				ctx,
-				client,
-				remotePath,
-				path.Base(remotePath),
-				tarWriter,
-				onBytes,
-				onFileComplete,
-			)
-		}
-		tarCloseErr := tarWriter.Close()
-		gzipCloseErr := gzipWriter.Close()
-		if archiveErr == nil {
-			archiveErr = tarCloseErr
-		}
-		if archiveErr == nil {
-			archiveErr = gzipCloseErr
-		}
-	}
-	if archiveErr != nil {
-		return archiveErr
-	}
-	if err := archiveFile.Sync(); err != nil {
-		return err
-	}
-	if err := archiveFile.Close(); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if onProgress != nil {
-		// 压缩进度按源文件字节计数，归档生成后的上传不重复折算。
-		onProgress(remoteFileOperationProgress{
-			completed:  sourceCompleted,
-			total:      sourceTotal,
-			totalKnown: true,
-			files:      sourceFiles,
-			doneFiles:  doneFiles,
-			current:    target,
-		})
-	}
-	if err := uploadLocalFileToRemote(
-		ctx,
-		client,
-		localPath,
-		target,
-		nil,
-	); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (s *FileService) extractRemoteArchive(
