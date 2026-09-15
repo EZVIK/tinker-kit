@@ -291,7 +291,7 @@ function PipelineRuleRow({
       style={style}
       className={`json-pipeline-item border-b border-border px-3 pt-3.5 pb-6${item.enabled ? '' : ' opacity-[.55]'}${isDragging ? ' bg-[color-mix(in_oklch,var(--primary)_12%,transparent)]' : ''}`}
     >
-      <div className="json-pipeline-item-header grid min-w-0 grid-cols-[28px_24px_minmax(0,1fr)_28px_28px] items-center gap-2">
+      <div className="json-pipeline-item-header grid min-w-0 select-none grid-cols-[28px_24px_minmax(0,1fr)_28px_28px] items-center gap-2">
         <Button
           ref={setActivatorNodeRef}
           variant="ghost"

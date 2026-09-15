@@ -1726,7 +1726,7 @@ function AppShell() {
       <div className="app-shell relative grid h-dvh grid-rows-[38px_minmax(0,1fr)] bg-background">
         <div className="ambient pointer-events-none absolute inset-0 z-0" />
         <header
-          className="titlebar relative z-[2] flex h-full items-center border-b border-border bg-background px-4 pl-[76px] [--wails-draggable:drag]"
+          className="titlebar relative z-[2] flex h-full select-none items-center border-b border-border bg-background px-4 pl-[76px] [--wails-draggable:drag]"
           data-wails-drag
         >
           <Button

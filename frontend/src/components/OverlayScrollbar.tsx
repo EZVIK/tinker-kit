@@ -404,7 +404,7 @@ export default function OverlayScrollbar() {
         >
           {pane.v && (
             <div
-              className="overlay-scroll-thumb overlay-scroll-thumb-y absolute pointer-events-auto touch-none cursor-default outline-none"
+              className="overlay-scroll-thumb overlay-scroll-thumb-y absolute pointer-events-auto touch-none select-none cursor-default outline-none"
               role="scrollbar"
               tabIndex={0}
               aria-label={t('scrollbar.vertical')}
@@ -420,7 +420,7 @@ export default function OverlayScrollbar() {
           )}{' '}
           {pane.h && (
             <div
-              className="overlay-scroll-thumb overlay-scroll-thumb-x absolute pointer-events-auto touch-none cursor-default outline-none"
+              className="overlay-scroll-thumb overlay-scroll-thumb-x absolute pointer-events-auto touch-none select-none cursor-default outline-none"
               role="scrollbar"
               tabIndex={0}
               aria-label={t('scrollbar.horizontal')}

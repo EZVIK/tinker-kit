@@ -2404,7 +2404,7 @@ export default function SshFilesTool({ active }: Props) {
                             draggable
                             aria-busy={dragPreparing === entry.path}
                             data-state={selected.includes(entry.path) ? 'selected' : undefined}
-                            className="group border-border/60"
+                            className="group select-none border-border/60"
                             onContextMenu={() => {
                               if (!selected.includes(entry.path)) setSelected([entry.path]);
                             }}

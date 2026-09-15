@@ -214,7 +214,7 @@ function TimeResultRow({
       ref={sortable.setNodeRef}
       style={style}
       data-time-result-id={id}
-      className={`grid min-h-11 items-center border-b border-border px-1 ${editing ? 'grid-cols-[30px_110px_minmax(0,1fr)_34px]' : 'grid-cols-[110px_minmax(0,1fr)]'} ${hidden ? 'opacity-40' : ''} ${sortable.isDragging ? 'bg-accent' : ''}`}
+      className={`grid min-h-11 items-center border-b border-border px-1 ${editing ? 'grid-cols-[30px_110px_minmax(0,1fr)_34px] select-none' : 'grid-cols-[110px_minmax(0,1fr)]'} ${hidden ? 'opacity-40' : ''} ${sortable.isDragging ? 'bg-accent' : ''}`}
     >
       {editing && (
         <Button
