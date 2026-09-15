@@ -422,7 +422,7 @@ function taskPercent(task: FileTask) {
 }
 
 function taskUsesByteProgress(task: FileTask) {
-  return task.type === 'compress' || task.type === 'extract';
+  return task.type === 'download' || task.type === 'compress' || task.type === 'extract';
 }
 
 function taskTypeLabel(type: string, t: (key: string) => string) {
