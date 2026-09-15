@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -434,6 +436,13 @@ func remoteTransferCommand(operation, source, destination string) string {
 }
 
 const remoteArchiveProgressPollInterval = 500 * time.Millisecond
+
+const (
+	remoteDownloadWorkerCount       = 4
+	remoteDownloadSegmentSize int64 = 8 * 1024 * 1024
+	// 外层分段并发与 SFTP 包级并发分开限额，避免每个 worker 再展开默认的 64 个请求。
+	remoteDownloadSFTPRequestCount = 8
+)
 
 const remoteTarArchiveProbeAwk = `awk '
 $1 ~ /^-/ {
@@ -923,6 +932,14 @@ func remoteCreationTimes(
 }
 
 func (s *FileService) dialSFTP(ctx context.Context, conn SSHConnection) (*ssh.Client, *sftp.Client, error) {
+	return s.dialSFTPWithOptions(ctx, conn)
+}
+
+func (s *FileService) dialSFTPWithOptions(
+	ctx context.Context,
+	conn SSHConnection,
+	options ...sftp.ClientOption,
+) (*ssh.Client, *sftp.Client, error) {
 	if conn.Mode == "local" {
 		alias := strings.TrimSpace(conn.Alias)
 		if !validSSHHost(alias) {
@@ -942,7 +959,7 @@ func (s *FileService) dialSFTP(ctx context.Context, conn SSHConnection) (*ssh.Cl
 		if err := command.Start(); err != nil {
 			return nil, nil, fmt.Errorf("启动系统 SSH 失败: %w", err)
 		}
-		client, err := sftp.NewClientPipe(stdout, stdin)
+		client, err := sftp.NewClientPipe(stdout, stdin, options...)
 		if err != nil {
 			_ = command.Process.Kill()
 			_ = command.Wait()
@@ -981,7 +998,7 @@ func (s *FileService) dialSFTP(ctx context.Context, conn SSHConnection) (*ssh.Cl
 		}
 		return nil, nil, errors.New("SSH 认证失败")
 	}
-	sftpClient, err := sftp.NewClient(client)
+	sftpClient, err := sftp.NewClient(client, options...)
 	if err != nil {
 		_ = client.Close()
 		return nil, nil, fmt.Errorf("创建 SFTP 会话失败: %w", err)
@@ -2279,14 +2296,19 @@ func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, e
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	sshClient, client, err := s.dialSFTP(ctx, conn)
+	sshClient, client, err := s.dialSFTPWithOptions(
+		ctx,
+		conn,
+		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
+	)
 	if err != nil {
 		return "", err
 	}
 	defer closeSSHClient(sshClient)
 	defer client.Close()
 	remotePath = normalizedRemotePath(remotePath)
-	if _, err := client.Lstat(remotePath); err != nil {
+	info, err := client.Lstat(remotePath)
+	if err != nil {
 		return "", err
 	}
 	directory, err := os.MkdirTemp("", "tinkerkit-ssh-drag-")
@@ -2295,8 +2317,23 @@ func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, e
 	}
 	s.registerDragTemp(directory)
 	target := filepath.Join(directory, filepath.Base(remotePath))
-	done, doneFiles := int64(0), 0
-	if err := s.downloadRemotePath(ctx, client, remotePath, target, "", &done, &doneFiles); err != nil {
+	items := make([]remoteTreeItem, 0)
+	if err := collectRemoteTree(ctx, client, remotePath, target, info, &items); err != nil {
+		s.removeDragTemp(directory)
+		return "", err
+	}
+	files, err := prepareRemoteDownloadFiles(items)
+	if err != nil {
+		s.removeDragTemp(directory)
+		return "", err
+	}
+	defer cleanupRemoteDownloadFiles(files)
+	defer closeRemoteDownloadFiles(files)
+	if err := s.downloadRemoteFiles(ctx, client, files, ""); err != nil {
+		s.removeDragTemp(directory)
+		return "", err
+	}
+	if err := finalizeRemoteDownloadFiles(files); err != nil {
 		s.removeDragTemp(directory)
 		return "", err
 	}
@@ -2306,27 +2343,48 @@ func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, e
 
 type remoteTreeItem struct {
 	remote string
+	local  string
 	info   os.FileInfo
 }
 
-func collectRemoteTree(client *sftp.Client, root string, out *[]remoteTreeItem) error {
-	info, err := client.Lstat(root)
-	if err != nil {
+func collectRemoteTree(
+	ctx context.Context,
+	client *sftp.Client,
+	root, localRoot string,
+	rootInfo os.FileInfo,
+	out *[]remoteTreeItem,
+) error {
+	if err := ctx.Err(); err != nil {
 		return err
+	}
+	info := rootInfo
+	if info == nil {
+		var err error
+		info, err = client.Lstat(root)
+		if err != nil {
+			return err
+		}
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
-	*out = append(*out, remoteTreeItem{remote: root, info: info})
+	*out = append(*out, remoteTreeItem{remote: root, local: localRoot, info: info})
 	if !info.IsDir() {
 		return nil
 	}
-	entries, err := client.ReadDir(root)
+	entries, err := client.ReadDirContext(ctx, root)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if err := collectRemoteTree(client, remoteChild(root, entry.Name()), out); err != nil {
+		if err := collectRemoteTree(
+			ctx,
+			client,
+			remoteChild(root, entry.Name()),
+			filepath.Join(localRoot, entry.Name()),
+			nil,
+			out,
+		); err != nil {
 			return err
 		}
 	}
@@ -2484,7 +2542,11 @@ func (s *FileService) runFileDownload(ctx context.Context, taskID, sourceID stri
 		s.finishFileTask(taskID, err)
 		return
 	}
-	sshClient, client, err := s.dialSFTP(ctx, conn)
+	sshClient, client, err := s.dialSFTPWithOptions(
+		ctx,
+		conn,
+		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
+	)
 	if err != nil {
 		s.finishFileTask(taskID, err)
 		return
@@ -2494,7 +2556,17 @@ func (s *FileService) runFileDownload(ctx context.Context, taskID, sourceID stri
 	s.updateFileTask(taskID, func(task *fileTaskState) { task.Status, task.Stage = fileTaskScanning, fileTaskScanning })
 	items := make([]remoteTreeItem, 0)
 	for _, remote := range remotePaths {
-		if err = collectRemoteTree(client, normalizedRemotePath(remote), &items); err != nil {
+		normalized := normalizedRemotePath(remote)
+		info, statErr := client.Lstat(normalized)
+		if statErr != nil {
+			s.finishFileTask(taskID, statErr)
+			return
+		}
+		destination := target
+		if len(remotePaths) > 1 || info.IsDir() {
+			destination = filepath.Join(target, filepath.Base(normalized))
+		}
+		if err = collectRemoteTree(ctx, client, normalized, destination, info, &items); err != nil {
 			s.finishFileTask(taskID, err)
 			return
 		}
@@ -2511,105 +2583,328 @@ func (s *FileService) runFileDownload(ctx context.Context, taskID, sourceID stri
 		task.Total, task.Files = total, files
 		task.Status, task.Stage = fileTaskRunning, "downloading"
 	})
-	var done int64
-	doneFiles := 0
-	for _, remote := range remotePaths {
-		info, statErr := client.Lstat(normalizedRemotePath(remote))
-		if statErr != nil {
-			s.finishFileTask(taskID, statErr)
-			return
-		}
-		destination := target
-		if len(remotePaths) > 1 || info.IsDir() {
-			destination = filepath.Join(target, filepath.Base(remote))
-		}
-		if err = s.downloadRemotePath(ctx, client, normalizedRemotePath(remote), destination, taskID, &done, &doneFiles); err != nil {
-			s.finishFileTask(taskID, err)
-			return
-		}
+	filesToDownload, err := prepareRemoteDownloadFiles(items)
+	if err != nil {
+		s.finishFileTask(taskID, err)
+		return
+	}
+	defer cleanupRemoteDownloadFiles(filesToDownload)
+	defer closeRemoteDownloadFiles(filesToDownload)
+	if err := s.downloadRemoteFiles(ctx, client, filesToDownload, taskID); err != nil {
+		s.finishFileTask(taskID, err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		s.finishFileTask(taskID, err)
+		return
+	}
+	if err := finalizeRemoteDownloadFiles(filesToDownload); err != nil {
+		s.finishFileTask(taskID, err)
+		return
 	}
 	s.updateFileTask(taskID, func(task *fileTaskState) {
-		task.Status, task.Stage, task.Completed, task.DoneFiles = fileTaskSuccess, "done", done, doneFiles
+		task.Status, task.Stage, task.Completed, task.DoneFiles = fileTaskSuccess, "done", task.Total, task.Files
 		task.Current = ""
 	})
 }
 
-func (s *FileService) downloadRemotePath(ctx context.Context, client *sftp.Client, remotePath, localPath, taskID string, done *int64, doneFiles *int) error {
-	info, err := client.Lstat(remotePath)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil
-	}
-	if info.IsDir() {
-		if err := os.MkdirAll(localPath, 0o755); err != nil {
-			return err
+type remoteDownloadFile struct {
+	remotePath string
+	localPath  string
+	size       int64
+	temp       *os.File
+
+	// 同一远程文件的所有分段共享一个句柄，ReadAt 支持并发读取。
+	remoteMu   sync.Mutex
+	remoteFile *sftp.File
+
+	segmentCount      int
+	completedSegments atomic.Int32
+}
+
+type remoteDownloadSegment struct {
+	file   *remoteDownloadFile
+	offset int64
+	length int
+}
+
+func prepareRemoteDownloadFiles(items []remoteTreeItem) ([]*remoteDownloadFile, error) {
+	for _, item := range items {
+		if !item.info.IsDir() {
+			continue
 		}
-		entries, err := client.ReadDir(remotePath)
+		if err := os.MkdirAll(item.local, 0o755); err != nil {
+			return nil, fmt.Errorf("创建下载目录 %q 失败: %w", item.local, err)
+		}
+	}
+
+	files := make([]*remoteDownloadFile, 0)
+	for _, item := range items {
+		if !item.info.Mode().IsRegular() {
+			continue
+		}
+		parent := filepath.Dir(item.local)
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			cleanupRemoteDownloadFiles(files)
+			return nil, fmt.Errorf("创建下载目录 %q 失败: %w", parent, err)
+		}
+		temp, err := os.CreateTemp(parent, ".tinkerkit-download-*")
 		if err != nil {
-			return err
+			cleanupRemoteDownloadFiles(files)
+			return nil, fmt.Errorf("创建下载临时文件 %q 失败: %w", item.local, err)
 		}
-		for _, entry := range entries {
-			if err := s.downloadRemotePath(ctx, client, remoteChild(remotePath, entry.Name()), filepath.Join(localPath, entry.Name()), taskID, done, doneFiles); err != nil {
-				return err
+		file := &remoteDownloadFile{
+			remotePath: item.remote,
+			localPath:  item.local,
+			size:       item.info.Size(),
+			temp:       temp,
+		}
+		files = append(files, file)
+		if err := temp.Truncate(file.size); err != nil {
+			cleanupRemoteDownloadFiles(files)
+			return nil, fmt.Errorf("预分配下载文件 %q 失败: %w", item.local, err)
+		}
+	}
+	return files, nil
+}
+
+func cleanupRemoteDownloadFiles(files []*remoteDownloadFile) {
+	for _, file := range files {
+		if file.temp == nil {
+			continue
+		}
+		tempPath := file.temp.Name()
+		_ = file.temp.Close()
+		_ = os.Remove(tempPath)
+		file.temp = nil
+	}
+}
+
+func (file *remoteDownloadFile) openRemote(client *sftp.Client) (*sftp.File, error) {
+	file.remoteMu.Lock()
+	defer file.remoteMu.Unlock()
+	if file.remoteFile != nil {
+		return file.remoteFile, nil
+	}
+	remote, err := client.Open(file.remotePath)
+	if err != nil {
+		return nil, err
+	}
+	file.remoteFile = remote
+	return remote, nil
+}
+
+func (file *remoteDownloadFile) closeRemote() {
+	file.remoteMu.Lock()
+	remote := file.remoteFile
+	file.remoteFile = nil
+	file.remoteMu.Unlock()
+	if remote != nil {
+		_ = remote.Close()
+	}
+}
+
+func closeRemoteDownloadFiles(files []*remoteDownloadFile) {
+	for _, file := range files {
+		file.closeRemote()
+	}
+}
+
+func finalizeRemoteDownloadFiles(files []*remoteDownloadFile) error {
+	closeRemoteDownloadFiles(files)
+	for _, file := range files {
+		if file.temp == nil {
+			continue
+		}
+		tempPath := file.temp.Name()
+		if err := file.temp.Sync(); err != nil {
+			return fmt.Errorf("同步下载文件 %q 失败: %w", file.localPath, err)
+		}
+		if err := file.temp.Close(); err != nil {
+			return fmt.Errorf("关闭下载文件 %q 失败: %w", file.localPath, err)
+		}
+		if err := os.Rename(tempPath, file.localPath); err != nil {
+			return fmt.Errorf("保存下载文件 %q 失败: %w", file.localPath, err)
+		}
+		file.temp = nil
+	}
+	return nil
+}
+
+func remoteDownloadSegments(files []*remoteDownloadFile) []remoteDownloadSegment {
+	segments := make([]remoteDownloadSegment, 0)
+	for _, file := range files {
+		file.segmentCount = 0
+		file.completedSegments.Store(0)
+		for offset := int64(0); offset < file.size; {
+			length := remoteDownloadSegmentSize
+			if remaining := file.size - offset; remaining < length {
+				length = remaining
 			}
+			segments = append(segments, remoteDownloadSegment{
+				file:   file,
+				offset: offset,
+				length: int(length),
+			})
+			file.segmentCount++
+			offset += length
 		}
-		return nil
 	}
-	if !info.Mode().IsRegular() {
-		return nil
+	return segments
+}
+
+func downloadRemoteSegment(
+	ctx context.Context,
+	client *sftp.Client,
+	segment remoteDownloadSegment,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+	remote, err := segment.file.openRemote(client)
+	if err != nil {
+		return 0, fmt.Errorf("打开远程文件 %q 失败: %w", segment.file.remotePath, err)
+	}
+	buffer := make([]byte, segment.length)
+	read, readErr := remote.ReadAt(buffer, segment.offset)
+	if read != segment.length {
+		if readErr == nil || errors.Is(readErr, io.EOF) {
+			readErr = io.ErrUnexpectedEOF
+		}
+		return int64(read), fmt.Errorf(
+			"读取远程文件 %q 的分段失败（偏移 %d，长度 %d）: %w",
+			segment.file.remotePath,
+			segment.offset,
+			segment.length,
+			readErr,
+		)
+	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return int64(read), fmt.Errorf("读取远程文件 %q 失败: %w", segment.file.remotePath, readErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	written, writeErr := segment.file.temp.WriteAt(buffer, segment.offset)
+	if writeErr != nil {
+		return int64(written), fmt.Errorf("写入下载文件 %q 失败: %w", segment.file.localPath, writeErr)
+	}
+	if written != segment.length {
+		return int64(written), fmt.Errorf("写入下载文件 %q: %w", segment.file.localPath, io.ErrShortWrite)
+	}
+	return int64(written), nil
+}
+
+func (s *FileService) downloadRemoteFiles(
+	ctx context.Context,
+	client *sftp.Client,
+	files []*remoteDownloadFile,
+	taskID string,
+) error {
+	segments := remoteDownloadSegments(files)
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(localPath), ".tinkerkit-download-*")
+
+	var completed atomic.Int64
+	var doneFiles atomic.Int32
+	for _, file := range files {
+		if file.segmentCount == 0 {
+			doneFiles.Add(1)
+		}
+	}
+	if len(segments) == 0 {
+		return nil
+	}
+
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	work := make(chan remoteDownloadSegment)
+	workerCount := remoteDownloadWorkerCount
+	if workerCount > len(segments) {
+		workerCount = len(segments)
+	}
+
+	var firstErr error
+	var firstErrMu sync.Mutex
+	setError := func(err error) {
+		if err == nil {
+			return
+		}
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		firstErrMu.Unlock()
+	}
+	reportProgress := func(segment remoteDownloadSegment, written int64) {
+		total := completed.Add(written)
+		if segment.file.completedSegments.Add(1) == int32(segment.file.segmentCount) {
+			segment.file.closeRemote()
+			doneFiles.Add(1)
+		}
+		if taskID == "" {
+			return
+		}
+		current := segment.file.remotePath
+		done := doneFiles.Load()
+		s.updateFileTask(taskID, func(task *fileTaskState) {
+			if total > task.Completed {
+				task.Completed = total
+			}
+			if int(done) > task.DoneFiles {
+				task.DoneFiles = int(done)
+			}
+			task.Current = current
+		})
+	}
+
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case segment, ok := <-work:
+					if !ok {
+						return
+					}
+					written, err := downloadRemoteSegment(workCtx, client, segment)
+					if err != nil {
+						setError(err)
+						return
+					}
+					reportProgress(segment, written)
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(work)
+		for _, segment := range segments {
+			select {
+			case work <- segment:
+			case <-workCtx.Done():
+				return
+			}
+		}
+	}()
+	workers.Wait()
+
+	firstErrMu.Lock()
+	err := firstErr
+	firstErrMu.Unlock()
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	input, err := client.Open(remotePath)
-	if err != nil {
-		tmp.Close()
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer input.Close()
-	buf := make([]byte, 256*1024)
-	for {
-		if err := ctx.Err(); err != nil {
-			tmp.Close()
-			return err
-		}
-		n, readErr := input.Read(buf)
-		if n > 0 {
-			if _, err = tmp.Write(buf[:n]); err != nil {
-				tmp.Close()
-				return err
-			}
-			*done += int64(n)
-			s.updateFileTask(taskID, func(task *fileTaskState) { task.Completed, task.Current = *done, remotePath })
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			tmp.Close()
-			return readErr
-		}
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, localPath); err != nil {
-		return err
-	}
-	*doneFiles++
-	s.updateFileTask(taskID, func(task *fileTaskState) { task.DoneFiles = *doneFiles })
 	return nil
 }
 

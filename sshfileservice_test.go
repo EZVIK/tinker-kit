@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -496,6 +498,130 @@ func TestLocalTreeCountsRegularFilesAndBytes(t *testing.T) {
 	}
 	if total != 8 || files != 2 {
 		t.Fatalf("localTree() = (%d, %d), want (8, 2)", total, files)
+	}
+}
+
+func TestRemoteDownloadSegmentsUseFixedRanges(t *testing.T) {
+	files := []*remoteDownloadFile{
+		{remotePath: "/large.bin", size: remoteDownloadSegmentSize*2 + 3},
+		{remotePath: "/empty.bin"},
+		{remotePath: "/small.bin", size: 5},
+	}
+	segments := remoteDownloadSegments(files)
+	want := []struct {
+		remote string
+		offset int64
+		length int
+	}{
+		{remote: "/large.bin", offset: 0, length: int(remoteDownloadSegmentSize)},
+		{remote: "/large.bin", offset: remoteDownloadSegmentSize, length: int(remoteDownloadSegmentSize)},
+		{remote: "/large.bin", offset: remoteDownloadSegmentSize * 2, length: 3},
+		{remote: "/small.bin", offset: 0, length: 5},
+	}
+	if len(segments) != len(want) {
+		t.Fatalf("远程下载分段数 = %d, want %d", len(segments), len(want))
+	}
+	for index, segment := range segments {
+		expected := want[index]
+		if segment.file.remotePath != expected.remote ||
+			segment.offset != expected.offset ||
+			segment.length != expected.length {
+			t.Errorf("第 %d 个远程下载分段 = (%q, %d, %d), want (%q, %d, %d)",
+				index,
+				segment.file.remotePath,
+				segment.offset,
+				segment.length,
+				expected.remote,
+				expected.offset,
+				expected.length,
+			)
+		}
+	}
+	if files[0].segmentCount != 3 || files[1].segmentCount != 0 || files[2].segmentCount != 1 {
+		t.Fatalf(
+			"远程文件分段计数 = (%d, %d, %d), want (3, 0, 1)",
+			files[0].segmentCount,
+			files[1].segmentCount,
+			files[2].segmentCount,
+		)
+	}
+}
+
+func TestDownloadRemoteFilesAssemblesSFTPSegments(t *testing.T) {
+	remoteRoot := t.TempDir()
+	remotePath := filepath.Join(remoteRoot, "source.bin")
+	payload := make([]byte, int(remoteDownloadSegmentSize*2+123))
+	for index := range payload {
+		payload[index] = byte(index % 251)
+	}
+	if err := os.WriteFile(remotePath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	server, err := sftp.NewServer(serverConn, sftp.WithServerWorkingDirectory(remoteRoot))
+	if err != nil {
+		t.Fatalf("创建测试 SFTP 服务失败: %v", err)
+	}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve() }()
+	client, err := sftp.NewClientPipe(
+		clientConn,
+		clientConn,
+		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
+	)
+	if err != nil {
+		_ = clientConn.Close()
+		<-serverDone
+		t.Fatalf("创建测试 SFTP 客户端失败: %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Error("测试 SFTP 服务未及时退出")
+		}
+	}()
+
+	info, err := client.Lstat("source.bin")
+	if err != nil {
+		t.Fatalf("读取测试远程文件信息失败: %v", err)
+	}
+	localPath := filepath.Join(t.TempDir(), "nested", "target.bin")
+	files, err := prepareRemoteDownloadFiles([]remoteTreeItem{{
+		remote: "source.bin",
+		local:  localPath,
+		info:   info,
+	}})
+	if err != nil {
+		t.Fatalf("准备测试下载文件失败: %v", err)
+	}
+	defer cleanupRemoteDownloadFiles(files)
+	service := &FileService{}
+	taskContext, taskCancel := context.WithCancel(context.Background())
+	defer taskCancel()
+	taskID := service.createFileTask(
+		FileTask{Type: fileTaskTypeDownload, Total: int64(len(payload)), Files: 1},
+		taskContext,
+		taskCancel,
+	)
+	if err := service.downloadRemoteFiles(taskContext, client, files, taskID); err != nil {
+		t.Fatalf("执行分段下载失败: %v", err)
+	}
+	task := service.GetFileTasks().Tasks[0]
+	if task.Completed != int64(len(payload)) || task.DoneFiles != 1 {
+		t.Fatalf("下载任务进度 = (%d, %d), want (%d, 1)", task.Completed, task.DoneFiles, len(payload))
+	}
+	if err := finalizeRemoteDownloadFiles(files); err != nil {
+		t.Fatalf("完成测试下载失败: %v", err)
+	}
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("读取测试下载结果失败: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("分段下载结果不一致: got %d bytes, want %d", len(got), len(payload))
 	}
 }
 
