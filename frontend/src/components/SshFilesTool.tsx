@@ -514,6 +514,10 @@ type SortDirection = 'asc' | 'desc';
 type RemoteSearchMode = 'name' | 'content';
 type RemoteSearchScope = 'current' | 'recursive';
 type MissingFavoritePath = { sourceID: string; path: string; previousPath: string };
+type LoadingKind = 'sources' | 'directory' | 'search';
+type CancellableCall = {
+  cancel: (cause?: unknown) => PromiseLike<void> | void;
+};
 
 export default function SshFilesTool({ active }: Props) {
   const { t, i18n } = useTranslation();
@@ -537,6 +541,7 @@ export default function SshFilesTool({ active }: Props) {
   const [selected, setSelected] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingSources, setLoadingSources] = useState(false);
+  const [loadingCanceled, setLoadingCanceled] = useState<LoadingKind | null>(null);
   const [error, setError] = useState('');
   const [tasks, setTasks] = useState<FileTask[]>([]);
   const [tasksOpen, setTasksOpen] = useState(false);
@@ -586,8 +591,11 @@ export default function SshFilesTool({ active }: Props) {
   const notifiedTaskFailures = useRef(new Set<string>());
   const handledConflictTasks = useRef(new Set<string>());
   const taskRevisionRef = useRef(0);
+  const sourcesRequestRef = useRef(0);
   const directoryRequestRef = useRef(0);
   const searchRequestRef = useRef(0);
+  const loadingKindRef = useRef<LoadingKind | null>(null);
+  const loadingCallsRef = useRef(new Set<CancellableCall>());
   const pendingFavoritePathRef = useRef<MissingFavoritePath | null>(null);
   const sourceIDRef = useRef(sourceID);
   const currentPathRef = useRef(currentPath);
@@ -603,6 +611,34 @@ export default function SshFilesTool({ active }: Props) {
     defaultPath: '/',
     favoritePaths: [],
   });
+
+  const cancelLoading = useCallback(() => {
+    const kind = loadingKindRef.current;
+    if (!kind) return;
+    sourcesRequestRef.current++;
+    directoryRequestRef.current++;
+    searchRequestRef.current++;
+    const requests = Array.from(loadingCallsRef.current);
+    loadingCallsRef.current.clear();
+    loadingKindRef.current = null;
+    for (const request of requests) void request.cancel();
+    setLoadingSources(false);
+    setLoading(false);
+    setSearching(false);
+    setError('');
+    setLoadingCanceled(kind);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      sourcesRequestRef.current++;
+      directoryRequestRef.current++;
+      searchRequestRef.current++;
+      const requests = Array.from(loadingCallsRef.current);
+      loadingCallsRef.current.clear();
+      for (const request of requests) void request.cancel();
+    };
+  }, []);
 
   const source = sources.find((item) => item.id === sourceID) ?? null;
   const favoritePaths = source?.favoritePaths ?? [];
@@ -637,25 +673,45 @@ export default function SshFilesTool({ active }: Props) {
   }, []);
 
   const loadSources = useCallback(async () => {
+    const requestID = ++sourcesRequestRef.current;
+    loadingKindRef.current = 'sources';
+    setLoadingCanceled(null);
     setLoadingSources(true);
     setError('');
+    let connectionRequest: ReturnType<typeof GetSSHConnections> | null = null;
+    let sourceRequest: ReturnType<typeof GetFileSources> | null = null;
     try {
+      connectionRequest = GetSSHConnections();
+      sourceRequest = GetFileSources();
+      loadingCallsRef.current.add(connectionRequest);
+      loadingCallsRef.current.add(sourceRequest);
       const [nextConnections, nextSources] = await Promise.all([
-        GetSSHConnections(),
-        GetFileSources(),
+        connectionRequest,
+        sourceRequest,
       ]);
+      if (requestID !== sourcesRequestRef.current) return;
       setConnections(nextConnections ?? []);
       setSources(nextSources ?? []);
       setSourceID((current) =>
         nextSources?.some((item) => item.id === current) ? current : nextSources?.[0]?.id || '',
       );
+    } catch (reason) {
+      if (requestID !== sourcesRequestRef.current) return;
+      throw reason;
     } finally {
-      setLoadingSources(false);
+      if (connectionRequest) loadingCallsRef.current.delete(connectionRequest);
+      if (sourceRequest) loadingCallsRef.current.delete(sourceRequest);
+      if (requestID === sourcesRequestRef.current) {
+        setLoadingSources(false);
+        if (loadingKindRef.current === 'sources') loadingKindRef.current = null;
+      }
     }
   }, []);
 
   const loadDirectory = useCallback(async (id: string, pathValue: string, hidden: boolean) => {
     const requestID = ++directoryRequestRef.current;
+    loadingKindRef.current = 'directory';
+    setLoadingCanceled(null);
     const normalizedPath = normalizeRemotePath(pathValue);
     const pendingFavoritePath =
       pendingFavoritePathRef.current?.sourceID === id &&
@@ -665,6 +721,7 @@ export default function SshFilesTool({ active }: Props) {
     pendingFavoritePathRef.current = null;
     setMissingFavoritePath(null);
     if (!id) {
+      if (loadingKindRef.current === 'directory') loadingKindRef.current = null;
       setEntries([]);
       setSelected([]);
       setError('');
@@ -675,8 +732,10 @@ export default function SshFilesTool({ active }: Props) {
     setError('');
     setEntries([]);
     setSelected([]);
+    const request = ListRemoteFiles(id, normalizedPath, hidden);
+    loadingCallsRef.current.add(request);
     try {
-      const result = await ListRemoteFiles(id, normalizedPath, hidden);
+      const result = await request;
       if (requestID !== directoryRequestRef.current) return;
       setEntries(result ?? []);
     } catch (reason) {
@@ -688,7 +747,11 @@ export default function SshFilesTool({ active }: Props) {
         setMissingFavoritePath(pendingFavoritePath);
       }
     } finally {
-      if (requestID === directoryRequestRef.current) setLoading(false);
+      loadingCallsRef.current.delete(request);
+      if (requestID === directoryRequestRef.current) {
+        setLoading(false);
+        if (loadingKindRef.current === 'directory') loadingKindRef.current = null;
+      }
     }
   }, []);
 
@@ -711,6 +774,8 @@ export default function SshFilesTool({ active }: Props) {
 
     const requestID = ++searchRequestRef.current;
     directoryRequestRef.current++;
+    loadingKindRef.current = 'search';
+    setLoadingCanceled(null);
     setSearchInput(query);
     setSearchQuery(query);
     setSearchActive(true);
@@ -719,15 +784,17 @@ export default function SshFilesTool({ active }: Props) {
     setError('');
     setEntries([]);
     setSelected([]);
+    const request = SearchRemoteFiles(
+      sourceID,
+      currentPath,
+      query,
+      searchMode,
+      searchScope,
+      showHidden,
+    );
+    loadingCallsRef.current.add(request);
     try {
-      const result = await SearchRemoteFiles(
-        sourceID,
-        currentPath,
-        query,
-        searchMode,
-        searchScope,
-        showHidden,
-      );
+      const result = await request;
       if (requestID !== searchRequestRef.current) return;
       setEntries(result ?? []);
     } catch (reason) {
@@ -735,10 +802,25 @@ export default function SshFilesTool({ active }: Props) {
       setEntries([]);
       setError(errorMessage(reason));
     } finally {
+      loadingCallsRef.current.delete(request);
       if (requestID === searchRequestRef.current) {
         setLoading(false);
         setSearching(false);
+        if (loadingKindRef.current === 'search') loadingKindRef.current = null;
       }
+    }
+  };
+
+  const retryCanceledLoading = () => {
+    const kind = loadingCanceled;
+    setLoadingCanceled(null);
+    setError('');
+    if (kind === 'sources') {
+      void loadSources().catch((reason) => setError(errorMessage(reason)));
+    } else if (kind === 'search' && searchQuery) {
+      void executeSearch(searchQuery);
+    } else if (sourceID) {
+      void loadDirectory(sourceID, currentPath, showHidden);
     }
   };
 
@@ -770,10 +852,13 @@ export default function SshFilesTool({ active }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      cancelLoading();
+      return;
+    }
     resetSearchState();
     void loadSources().catch((reason) => setError(errorMessage(reason)));
-  }, [active, loadSources, resetSearchState]);
+  }, [active, cancelLoading, loadSources, resetSearchState]);
 
   useEffect(() => {
     if (!active) return;
@@ -2135,6 +2220,15 @@ export default function SshFilesTool({ active }: Props) {
               <span className="text-sm text-muted-foreground">
                 {t('sshFilesTool.loadingSources')}
               </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-1 h-7 px-2 text-xs"
+                onClick={cancelLoading}
+              >
+                <XCircle data-icon="inline-start" size={14} />
+                {t('common.cancel')}
+              </Button>
             </div>
           ) : loading ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
@@ -2145,6 +2239,34 @@ export default function SshFilesTool({ active }: Props) {
               <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
                 {currentPath}
               </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-1 h-7 px-2 text-xs"
+                onClick={cancelLoading}
+              >
+                <XCircle data-icon="inline-start" size={14} />
+                {t('common.cancel')}
+              </Button>
+            </div>
+          ) : loadingCanceled ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+              <XCircle size={16} weight="duotone" className="text-muted-foreground" />
+              <span className="text-sm text-muted-foreground">
+                {t('sshFilesTool.loadingCanceled')}
+              </span>
+              <span className="max-w-full truncate font-mono text-[11px] text-muted-foreground/70">
+                {t('sshFilesTool.loadingCanceledHint')}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-1 h-7 px-2 text-xs"
+                onClick={retryCanceledLoading}
+              >
+                <ArrowClockwise data-icon="inline-start" size={14} />
+                {t('sshFilesTool.refresh')}
+              </Button>
             </div>
           ) : !sourceID ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">

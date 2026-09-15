@@ -967,6 +967,8 @@
     "noSource": "未配置文件源",
     "loadingSources": "正在读取 SSH 文件源…",
     "loadingDirectory": "正在加载远程目录…",
+    "loadingCanceled": "加载已取消",
+    "loadingCanceledHint": "点击刷新可重新加载当前内容。",
     "showHidden": "显示隐藏文件",
     "upload": "上传",
     "manage": "管理",

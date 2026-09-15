@@ -967,6 +967,8 @@
     "noSource": "No file source configured",
     "loadingSources": "Loading SSH file sources…",
     "loadingDirectory": "Loading remote directory…",
+    "loadingCanceled": "Loading canceled",
+    "loadingCanceledHint": "Refresh to load the current content again.",
     "showHidden": "Show hidden files",
     "upload": "Upload",
     "manage": "Manage",
