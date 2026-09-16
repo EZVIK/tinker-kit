@@ -155,6 +155,16 @@ const emptyConnection: SSHConnection = {
   alias: '',
 };
 
+function emptyFileSource(sshConnectionID = ''): FileSource {
+  return {
+    id: '',
+    name: '',
+    sshConnectionID,
+    defaultPath: '',
+    favoritePaths: [],
+  };
+}
+
 function basename(path: string) {
   return path.split('/').filter(Boolean).pop() || path;
 }
@@ -690,8 +700,8 @@ export default function SshFilesTool({ active }: Props) {
   const [connections, setConnections] = useState<SSHConnection[]>([]);
   const [sources, setSources] = useState<FileSource[]>([]);
   const [sourceID, setSourceID] = useState('');
-  const [currentPath, setCurrentPath] = useState('/');
-  const [pathInput, setPathInput] = useState('/');
+  const [currentPath, setCurrentPath] = useState('');
+  const [pathInput, setPathInput] = useState('');
   const [pathEditing, setPathEditing] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -726,13 +736,7 @@ export default function SshFilesTool({ active }: Props) {
   const [sshHosts, setSshHosts] = useState<string[]>([]);
   const [sshHostsLoading, setSshHostsLoading] = useState(false);
   const [sshHostsError, setSshHostsError] = useState('');
-  const [sourceDraft, setSourceDraft] = useState<FileSource>({
-    id: '',
-    name: '',
-    sshConnectionID: '',
-    defaultPath: '/',
-    favoritePaths: [],
-  });
+  const [sourceDraft, setSourceDraft] = useState<FileSource>(emptyFileSource());
   const [uploadPaths, setUploadPaths] = useState<string[]>([]);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadTarget, setUploadTarget] = useState('/');
@@ -769,13 +773,7 @@ export default function SshFilesTool({ active }: Props) {
     sources: [],
   });
   const manageNewConnectionBaselineRef = useRef<SSHConnection>({ ...emptyConnection });
-  const manageNewSourceBaselineRef = useRef<FileSource>({
-    id: '',
-    name: '',
-    sshConnectionID: '',
-    defaultPath: '/',
-    favoritePaths: [],
-  });
+  const manageNewSourceBaselineRef = useRef<FileSource>(emptyFileSource());
 
   const cancelLoading = useCallback(() => {
     const kind = loadingKindRef.current;
@@ -889,7 +887,8 @@ export default function SshFilesTool({ active }: Props) {
     const requestID = ++directoryRequestRef.current;
     loadingKindRef.current = 'directory';
     setLoadingCanceled(null);
-    const normalizedPath = normalizeRemotePath(pathValue);
+    const requested = pathValue.trim();
+    const normalizedPath = requested ? normalizeRemotePath(requested) : '';
     const pendingFavoritePath =
       pendingFavoritePathRef.current?.sourceID === id &&
       pendingFavoritePathRef.current.path === normalizedPath
@@ -914,7 +913,19 @@ export default function SshFilesTool({ active }: Props) {
     try {
       const result = await request;
       if (requestID !== directoryRequestRef.current) return;
-      setEntries(result ?? []);
+      const resolved = result.path ? normalizeRemotePath(result.path) : normalizedPath;
+      setEntries(result.entries ?? []);
+      if (resolved) {
+        directoryLoadKeyRef.current = [
+          id,
+          activeSourceConnectionID,
+          connectionListingKey,
+          resolved,
+          hidden ? '1' : '0',
+        ].join('\0');
+        setCurrentPath(resolved);
+        setPathInput(resolved);
+      }
     } catch (reason) {
       if (requestID !== directoryRequestRef.current) return;
       setEntries([]);
@@ -930,7 +941,7 @@ export default function SshFilesTool({ active }: Props) {
         if (loadingKindRef.current === 'directory') loadingKindRef.current = null;
       }
     }
-  }, []);
+  }, [activeSourceConnectionID, connectionListingKey]);
 
   const resetSearchState = useCallback(() => {
     searchRequestRef.current++;
@@ -1076,10 +1087,13 @@ export default function SshFilesTool({ active }: Props) {
       return;
     }
     if (manageOpen) return;
-    const nextPath =
-      currentPath === '/' && sourceDefaultPath
+    const nextPath = sourceDefaultPath
+      ? currentPath === '/' || !currentPath.trim()
         ? normalizeRemotePath(sourceDefaultPath)
-        : normalizeRemotePath(currentPath);
+        : normalizeRemotePath(currentPath)
+      : currentPath.trim()
+        ? normalizeRemotePath(currentPath)
+        : '';
     if (nextPath !== currentPath) {
       setCurrentPath(nextPath);
       setPathInput(nextPath);
@@ -1527,13 +1541,7 @@ export default function SshFilesTool({ active }: Props) {
     const nextConnection = activeConnection ? { ...activeConnection } : { ...emptyConnection };
     const nextSource = activeSource
       ? { ...activeSource }
-      : {
-          id: '',
-          name: '',
-          sshConnectionID: activeConnection?.id ?? '',
-          defaultPath: '/',
-          favoritePaths: [],
-        };
+      : emptyFileSource(activeConnection?.id ?? '');
     manageBaselineRef.current = {
       connections: connections.map((item) => ({ ...item })),
       sources: sources.map((item) => ({ ...item })),
@@ -1574,17 +1582,11 @@ export default function SshFilesTool({ active }: Props) {
     setManageTab('connection');
     setManageEditor('connection');
     setConnectionDraft(draft);
-    setSourceDraft({ id: '', name: '', sshConnectionID: '', defaultPath: '/', favoritePaths: [] });
+    setSourceDraft(emptyFileSource());
     setManageFeedback(null);
   };
   const startNewFileSource = (connectionID = connectionDraft.id || connections[0]?.id || '') => {
-    const draft = {
-      id: crypto.randomUUID(),
-      name: '',
-      sshConnectionID: connectionID,
-      defaultPath: '/',
-      favoritePaths: [],
-    };
+    const draft = { ...emptyFileSource(connectionID), id: crypto.randomUUID() };
     manageNewSourceBaselineRef.current = { ...draft };
     setManageView('source');
     setManageTab('source');
@@ -1617,15 +1619,7 @@ export default function SshFilesTool({ active }: Props) {
     setSources(nextSources);
     setConnectionDraft(nextConnections[0] ? { ...nextConnections[0] } : { ...emptyConnection });
     setSourceDraft(
-      nextSources[0]
-        ? { ...nextSources[0] }
-        : {
-            id: '',
-            name: '',
-            sshConnectionID: nextConnections[0]?.id ?? '',
-            defaultPath: '/',
-            favoritePaths: [],
-          },
+      nextSources[0] ? { ...nextSources[0] } : emptyFileSource(nextConnections[0]?.id ?? ''),
     );
     setManageView('list');
     setManageTab('connection');
@@ -1639,13 +1633,7 @@ export default function SshFilesTool({ active }: Props) {
     setSourceDraft(
       nextSource
         ? { ...nextSource }
-        : {
-            id: '',
-            name: '',
-            sshConnectionID: connectionDraft.id || connections[0]?.id || '',
-            defaultPath: '/',
-            favoritePaths: [],
-          },
+        : emptyFileSource(connectionDraft.id || connections[0]?.id || ''),
     );
     setManageView('list');
     setManageTab('source');
@@ -1706,29 +1694,13 @@ export default function SshFilesTool({ active }: Props) {
     setConnections(nextConnections);
     setSources(nextSources);
     setConnectionDraft(nextConnection ? { ...nextConnection } : { ...emptyConnection });
-    setSourceDraft(
-      nextSource
-        ? { ...nextSource }
-        : {
-            id: '',
-            name: '',
-            sshConnectionID: nextConnection?.id ?? '',
-            defaultPath: '/',
-            favoritePaths: [],
-          },
-    );
+    setSourceDraft(nextSource ? { ...nextSource } : emptyFileSource(nextConnection?.id ?? ''));
     manageNewConnectionBaselineRef.current = nextConnection
       ? { ...nextConnection }
       : { ...emptyConnection };
     manageNewSourceBaselineRef.current = nextSource
       ? { ...nextSource }
-      : {
-          id: '',
-          name: '',
-          sshConnectionID: nextConnection?.id ?? '',
-          defaultPath: '/',
-          favoritePaths: [],
-        };
+      : emptyFileSource(nextConnection?.id ?? '');
     setManageView('list');
     setManageTab('source');
     setManageEditor(nextSource ? 'source' : 'connection');
@@ -2032,7 +2004,7 @@ export default function SshFilesTool({ active }: Props) {
                     setLoading(true);
                     setPathEditing(false);
                     setSourceID(value);
-                    setCurrentPath('/');
+                    setCurrentPath('');
                   }
                 }}
               >
@@ -3001,7 +2973,9 @@ export default function SshFilesTool({ active }: Props) {
                                   </span>
                                   <span aria-hidden="true">·</span>
                                   <span className="truncate font-mono">
-                                    {normalizeRemotePath(item.defaultPath || '/')}
+                                    {item.defaultPath.trim()
+                                      ? normalizeRemotePath(item.defaultPath)
+                                      : t('sshFilesTool.remoteHome')}
                                   </span>
                                 </span>
                               </span>
@@ -3487,6 +3461,7 @@ export default function SshFilesTool({ active }: Props) {
                         <Input
                           id="ssh-source-default-path"
                           value={sourceDraft.defaultPath}
+                          placeholder={t('sshFilesTool.remoteHome')}
                           onChange={(event) =>
                             setSourceDraft({ ...sourceDraft, defaultPath: event.target.value })
                           }

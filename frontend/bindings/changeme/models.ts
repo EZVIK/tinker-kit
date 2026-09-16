@@ -281,6 +281,15 @@ export interface RegistryPlatform {
     "variant": string;
 }
 
+/**
+ * RemoteDirectoryListing 是一次远程目录读取结果，Path 为实际列出的绝对路径。
+ * 请求路径为空时 Path 为 SFTP 工作目录（通常是 SSH 登录目录），而不是 "/"。
+ */
+export interface RemoteDirectoryListing {
+    "path": string;
+    "entries": RemoteFileEntry[] | null;
+}
+
 export interface RemoteFileEntry {
     "name": string;
     "path": string;

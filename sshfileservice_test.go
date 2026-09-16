@@ -37,6 +37,16 @@ func TestNormalizedRemotePath(t *testing.T) {
 	}
 }
 
+func TestResolveRemoteDirectoryKeepsRequestedPath(t *testing.T) {
+	got, err := resolveRemoteDirectory(nil, " /var/log ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/var/log" {
+		t.Errorf("resolveRemoteDirectory() = %q, want /var/log", got)
+	}
+}
+
 func TestRemoteSearchFilenameCommandUsesFDAndFindFallback(t *testing.T) {
 	command := remoteSearchCommand(
 		"needle's",

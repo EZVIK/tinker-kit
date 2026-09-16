@@ -74,6 +74,13 @@ type RemoteFileEntry struct {
 	CreatedAt  string `json:"createdAt"`
 }
 
+// RemoteDirectoryListing 是一次远程目录读取结果，Path 为实际列出的绝对路径。
+// 请求路径为空时 Path 为 SFTP 工作目录（通常是 SSH 登录目录），而不是 "/"。
+type RemoteDirectoryListing struct {
+	Path    string            `json:"path"`
+	Entries []RemoteFileEntry `json:"entries"`
+}
+
 type RemoteFileOperationResult struct {
 	Conflicts []string `json:"conflicts,omitempty"`
 }
@@ -345,6 +352,17 @@ func normalizedRemotePath(value string) string {
 		value = "/" + value
 	}
 	return path.Clean(value)
+}
+
+func resolveRemoteDirectory(client *sftp.Client, currentPath string) (string, error) {
+	if strings.TrimSpace(currentPath) != "" {
+		return normalizedRemotePath(currentPath), nil
+	}
+	wd, err := client.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("读取远程登录目录失败: %w", err)
+	}
+	return normalizedRemotePath(wd), nil
 }
 
 func remoteChild(parent, name string) string {
@@ -933,7 +951,10 @@ func (s *FileService) SearchRemoteFiles(
 	defer closeSSHClient(sshClient)
 	defer client.Close()
 
-	root := normalizedRemotePath(currentPath)
+	root, err := resolveRemoteDirectory(client, currentPath)
+	if err != nil {
+		return nil, err
+	}
 	output, err := runRemoteCommandOutput(
 		ctx,
 		conn,
@@ -1066,23 +1087,26 @@ func (s *FileService) dialSFTPWithOptions(
 	return client, sftpClient, nil
 }
 
-func (s *FileService) ListRemoteFiles(sourceID, currentPath string, showHidden bool) ([]RemoteFileEntry, error) {
+func (s *FileService) ListRemoteFiles(sourceID, currentPath string, showHidden bool) (RemoteDirectoryListing, error) {
 	_, conn, err := s.sourceSnapshot(sourceID)
 	if err != nil {
-		return nil, err
+		return RemoteDirectoryListing{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	sshClient, client, err := s.dialSFTP(ctx, conn)
 	if err != nil {
-		return nil, err
+		return RemoteDirectoryListing{}, err
 	}
 	defer closeSSHClient(sshClient)
 	defer client.Close()
-	remotePath := normalizedRemotePath(currentPath)
+	remotePath, err := resolveRemoteDirectory(client, currentPath)
+	if err != nil {
+		return RemoteDirectoryListing{}, err
+	}
 	entries, err := client.ReadDirContext(ctx, remotePath)
 	if err != nil {
-		return nil, fmt.Errorf("读取远程目录失败: %w", err)
+		return RemoteDirectoryListing{}, fmt.Errorf("读取远程目录失败: %w", err)
 	}
 	visibleEntries := make([]os.FileInfo, 0, len(entries))
 	for _, entry := range entries {
@@ -1097,7 +1121,7 @@ func (s *FileService) ListRemoteFiles(sourceID, currentPath string, showHidden b
 	}
 	createdAt, err := remoteCreationTimes(ctx, conn, sshClient, remotePaths)
 	if err != nil {
-		return nil, err
+		return RemoteDirectoryListing{}, err
 	}
 	result := make([]RemoteFileEntry, 0, len(visibleEntries))
 	for index, entry := range visibleEntries {
@@ -1109,7 +1133,7 @@ func (s *FileService) ListRemoteFiles(sourceID, currentPath string, showHidden b
 		}
 		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
 	})
-	return result, nil
+	return RemoteDirectoryListing{Path: remotePath, Entries: result}, nil
 }
 
 func remoteFileEntryFromInfo(remotePath string, entry os.FileInfo, createdAt string) RemoteFileEntry {
@@ -1144,7 +1168,11 @@ func (s *FileService) TestSSHFileConnection(connection SSHConnection, defaultPat
 	}
 	defer closeSSHClient(sshClient)
 	defer client.Close()
-	_, err = client.Stat(normalizedRemotePath(defaultPath))
+	remotePath, err := resolveRemoteDirectory(client, defaultPath)
+	if err != nil {
+		return err
+	}
+	_, err = client.Stat(remotePath)
 	if err != nil {
 		return fmt.Errorf("默认路径不可访问: %w", err)
 	}
