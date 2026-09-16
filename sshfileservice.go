@@ -419,6 +419,89 @@ func closeSSHClient(client *ssh.Client) {
 	}
 }
 
+func remoteDownloadSFTPOptions() []sftp.ClientOption {
+	return []sftp.ClientOption{
+		sftp.MaxPacketUnchecked(int(remoteDownloadPacketSize)),
+		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
+	}
+}
+
+func remoteDownloadConnectionWanted(files []*remoteDownloadFile) int {
+	segments := 0
+	for _, file := range files {
+		if file == nil || file.size <= 0 {
+			continue
+		}
+		n := file.size / remoteDownloadSegmentSize
+		if file.size%remoteDownloadSegmentSize != 0 {
+			n++
+		}
+		segments += int(n)
+	}
+	if segments <= 1 {
+		return 1
+	}
+	if segments > remoteDownloadConnectionCount {
+		return remoteDownloadConnectionCount
+	}
+	return segments
+}
+
+func closeDownloadSFTPClients(sshClients []*ssh.Client, sftpClients []*sftp.Client) {
+	for _, client := range sftpClients {
+		if client != nil {
+			_ = client.Close()
+		}
+	}
+	for _, client := range sshClients {
+		closeSSHClient(client)
+	}
+}
+
+func (s *FileService) expandDownloadSFTPClients(
+	ctx context.Context,
+	conn SSHConnection,
+	sshClients []*ssh.Client,
+	sftpClients []*sftp.Client,
+	wanted int,
+) ([]*ssh.Client, []*sftp.Client) {
+	extra := wanted - len(sftpClients)
+	if extra <= 0 || ctx.Err() != nil {
+		return sshClients, sftpClients
+	}
+	type dialed struct {
+		ssh  *ssh.Client
+		sftp *sftp.Client
+	}
+	results := make(chan dialed, extra)
+	var wait sync.WaitGroup
+	options := remoteDownloadSFTPOptions()
+	for range extra {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			extraSSH, extraSFTP, err := s.dialSFTPWithOptions(ctx, conn, options...)
+			if err != nil {
+				if extraSFTP != nil {
+					_ = extraSFTP.Close()
+				}
+				closeSSHClient(extraSSH)
+				return
+			}
+			results <- dialed{ssh: extraSSH, sftp: extraSFTP}
+		}()
+	}
+	go func() {
+		wait.Wait()
+		close(results)
+	}()
+	for item := range results {
+		sshClients = append(sshClients, item.ssh)
+		sftpClients = append(sftpClients, item.sftp)
+	}
+	return sshClients, sftpClients
+}
+
 func newSystemSFTPCommand(ctx context.Context, alias string) *exec.Cmd {
 	return exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", "-o", "RequestTTY=no", "-s", alias, "sftp")
 }
@@ -438,14 +521,15 @@ func remoteTransferCommand(operation, source, destination string) string {
 const remoteArchiveProgressPollInterval = 500 * time.Millisecond
 
 const (
-	remoteDownloadWorkerCount       = 4
-	remoteDownloadSegmentSize int64 = 8 * 1024 * 1024
-	// 与 pkg/sftp 默认 maxPacket（32KiB）对齐：单次 ReadAt 一个包，靠并发而不是大 buffer 维持流水线。
+	// 大文件用多条 SSH/SFTP 连接分片，各自占用独立 TCP 窗口和加解密循环。
+	remoteDownloadConnectionCount       = 4
+	remoteDownloadSegmentSize     int64 = 8 * 1024 * 1024
+	// 与几乎所有 SFTP 服务器都支持的 32KiB 包对齐，避免大包被短读后整段失败。
 	remoteDownloadPacketSize int64 = 32 * 1024
 	// 任务事件与 SFTP 包解耦，合并进度推送，避免每个包都发全量快照。
 	remoteDownloadProgressEmitInterval = 80 * time.Millisecond
-	// 外层分段并发与 SFTP 包级并发分开限额，避免每个 worker 再展开默认的 64 个请求。
-	remoteDownloadSFTPRequestCount = 8
+	// 单条连接上的在途读请求数，用来填满该连接的带宽时延积。
+	remoteDownloadSFTPRequestCount = 32
 )
 
 const remoteTarArchiveProbeAwk = `awk '
@@ -2300,16 +2384,13 @@ func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, e
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	sshClient, client, err := s.dialSFTPWithOptions(
-		ctx,
-		conn,
-		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
-	)
+	sshClient, client, err := s.dialSFTPWithOptions(ctx, conn, remoteDownloadSFTPOptions()...)
 	if err != nil {
 		return "", err
 	}
-	defer closeSSHClient(sshClient)
-	defer client.Close()
+	sshClients := []*ssh.Client{sshClient}
+	sftpClients := []*sftp.Client{client}
+	defer func() { closeDownloadSFTPClients(sshClients, sftpClients) }()
 	remotePath = normalizedRemotePath(remotePath)
 	info, err := client.Lstat(remotePath)
 	if err != nil {
@@ -2333,7 +2414,14 @@ func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, e
 	}
 	defer cleanupRemoteDownloadFiles(files)
 	defer closeRemoteDownloadFiles(files)
-	if err := s.downloadRemoteFiles(ctx, client, files, ""); err != nil {
+	sshClients, sftpClients = s.expandDownloadSFTPClients(
+		ctx,
+		conn,
+		sshClients,
+		sftpClients,
+		remoteDownloadConnectionWanted(files),
+	)
+	if err := s.downloadRemoteFiles(ctx, sftpClients, files, ""); err != nil {
 		s.removeDragTemp(directory)
 		return "", err
 	}
@@ -2546,17 +2634,14 @@ func (s *FileService) runFileDownload(ctx context.Context, taskID, sourceID stri
 		s.finishFileTask(taskID, err)
 		return
 	}
-	sshClient, client, err := s.dialSFTPWithOptions(
-		ctx,
-		conn,
-		sftp.MaxConcurrentRequestsPerFile(remoteDownloadSFTPRequestCount),
-	)
+	sshClient, client, err := s.dialSFTPWithOptions(ctx, conn, remoteDownloadSFTPOptions()...)
 	if err != nil {
 		s.finishFileTask(taskID, err)
 		return
 	}
-	defer closeSSHClient(sshClient)
-	defer client.Close()
+	sshClients := []*ssh.Client{sshClient}
+	sftpClients := []*sftp.Client{client}
+	defer func() { closeDownloadSFTPClients(sshClients, sftpClients) }()
 	s.updateFileTask(taskID, func(task *fileTaskState) { task.Status, task.Stage = fileTaskScanning, fileTaskScanning })
 	items := make([]remoteTreeItem, 0)
 	for _, remote := range remotePaths {
@@ -2594,7 +2679,14 @@ func (s *FileService) runFileDownload(ctx context.Context, taskID, sourceID stri
 	}
 	defer cleanupRemoteDownloadFiles(filesToDownload)
 	defer closeRemoteDownloadFiles(filesToDownload)
-	if err := s.downloadRemoteFiles(ctx, client, filesToDownload, taskID); err != nil {
+	sshClients, sftpClients = s.expandDownloadSFTPClients(
+		ctx,
+		conn,
+		sshClients,
+		sftpClients,
+		remoteDownloadConnectionWanted(filesToDownload),
+	)
+	if err := s.downloadRemoteFiles(ctx, sftpClients, filesToDownload, taskID); err != nil {
 		s.finishFileTask(taskID, err)
 		return
 	}
@@ -2618,9 +2710,9 @@ type remoteDownloadFile struct {
 	size       int64
 	temp       *os.File
 
-	// 同一远程文件的所有分段共享一个句柄，ReadAt 支持并发读取。
-	remoteMu   sync.Mutex
-	remoteFile *sftp.File
+	// 每个 SFTP 连接各自持有句柄，ReadAt 在同一连接内并发读取。
+	remoteMu sync.Mutex
+	remotes  map[*sftp.Client]*sftp.File
 
 	segmentCount      int
 	completedSegments atomic.Int32
@@ -2692,24 +2784,29 @@ func cleanupRemoteDownloadFiles(files []*remoteDownloadFile) {
 func (file *remoteDownloadFile) openRemote(client *sftp.Client) (*sftp.File, error) {
 	file.remoteMu.Lock()
 	defer file.remoteMu.Unlock()
-	if file.remoteFile != nil {
-		return file.remoteFile, nil
+	if file.remotes == nil {
+		file.remotes = map[*sftp.Client]*sftp.File{}
+	}
+	if remote := file.remotes[client]; remote != nil {
+		return remote, nil
 	}
 	remote, err := client.Open(file.remotePath)
 	if err != nil {
 		return nil, err
 	}
-	file.remoteFile = remote
+	file.remotes[client] = remote
 	return remote, nil
 }
 
 func (file *remoteDownloadFile) closeRemote() {
 	file.remoteMu.Lock()
-	remote := file.remoteFile
-	file.remoteFile = nil
+	remotes := file.remotes
+	file.remotes = nil
 	file.remoteMu.Unlock()
-	if remote != nil {
-		_ = remote.Close()
+	for _, remote := range remotes {
+		if remote != nil {
+			_ = remote.Close()
+		}
 	}
 }
 
@@ -2897,10 +2994,13 @@ func downloadRemoteSegment(
 
 func (s *FileService) downloadRemoteFiles(
 	ctx context.Context,
-	client *sftp.Client,
+	clients []*sftp.Client,
 	files []*remoteDownloadFile,
 	taskID string,
 ) error {
+	if len(clients) == 0 {
+		return errors.New("没有可用的 SFTP 连接")
+	}
 	segments := remoteDownloadSegments(files)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -2920,7 +3020,7 @@ func (s *FileService) downloadRemoteFiles(
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	work := make(chan remoteDownloadSegment)
-	workerCount := remoteDownloadWorkerCount
+	workerCount := len(clients)
 	if workerCount > len(segments) {
 		workerCount = len(segments)
 	}
@@ -3015,7 +3115,8 @@ func (s *FileService) downloadRemoteFiles(
 
 	var workers sync.WaitGroup
 	workers.Add(workerCount)
-	for range workerCount {
+	for _, client := range clients[:workerCount] {
+		client := client
 		go func() {
 			defer workers.Done()
 			for {
