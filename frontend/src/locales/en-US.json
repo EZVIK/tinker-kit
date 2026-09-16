@@ -1028,7 +1028,6 @@
     "addSource": "Add file source",
     "chooseUpload": "Choose files or folders to upload",
     "choose": "Choose",
-    "dragPreparing": "Preparing the file; drag again in a moment",
     "manageTitle": "Manage SSH file sources",
     "manageDesc": "One SSH connection can serve multiple file sources.",
     "backToList": "Back to list",

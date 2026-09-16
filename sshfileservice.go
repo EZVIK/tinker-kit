@@ -118,34 +118,6 @@ type fileTaskState struct {
 	operationPolicy string
 }
 
-// cleanupSSHDragTemps 清理上次进程遗留的跨应用拖出临时文件。
-// 临时文件只用于交给 Finder 或聊天工具，不作为远程缓存保留。
-func cleanupSSHDragTemps() {
-	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "tinkerkit-ssh-drag-*"))
-	if err != nil {
-		return
-	}
-	for _, item := range matches {
-		_ = os.RemoveAll(item)
-	}
-}
-
-func (s *FileService) registerDragTemp(directory string) {
-	s.dragTempMu.Lock()
-	if s.dragTemps == nil {
-		s.dragTemps = make(map[string]struct{})
-	}
-	s.dragTemps[directory] = struct{}{}
-	s.dragTempMu.Unlock()
-}
-
-func (s *FileService) removeDragTemp(directory string) {
-	s.dragTempMu.Lock()
-	delete(s.dragTemps, directory)
-	s.dragTempMu.Unlock()
-	_ = os.RemoveAll(directory)
-}
-
 func (s *FileService) setEventEmitter(emit func(string, any)) { s.emitEvent = emit }
 
 func (s *FileService) emitTasks(snapshot FileTaskSnapshot) {
@@ -2373,64 +2345,6 @@ func (s *FileService) StartFileDownload(sourceID string, remotePaths []string) (
 	)
 	go s.runFileDownload(ctx, id, sourceID, remotePaths, target)
 	return s.GetFileTasks(), nil
-}
-
-// PrepareFileForDrag 将远程项目准备到临时目录，返回可交给 Finder 或聊天工具的本地路径。
-// 调用方在 dragstart 前预取，避免把未完成的远程内容交给接收方。
-func (s *FileService) PrepareFileForDrag(sourceID, remotePath string) (string, error) {
-	_, conn, err := s.sourceSnapshot(sourceID)
-	if err != nil {
-		return "", err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	sshClient, client, err := s.dialSFTPWithOptions(ctx, conn, remoteDownloadSFTPOptions()...)
-	if err != nil {
-		return "", err
-	}
-	sshClients := []*ssh.Client{sshClient}
-	sftpClients := []*sftp.Client{client}
-	defer func() { closeDownloadSFTPClients(sshClients, sftpClients) }()
-	remotePath = normalizedRemotePath(remotePath)
-	info, err := client.Lstat(remotePath)
-	if err != nil {
-		return "", err
-	}
-	directory, err := os.MkdirTemp("", "tinkerkit-ssh-drag-")
-	if err != nil {
-		return "", err
-	}
-	s.registerDragTemp(directory)
-	target := filepath.Join(directory, filepath.Base(remotePath))
-	items := make([]remoteTreeItem, 0)
-	if err := collectRemoteTree(ctx, client, remotePath, target, info, &items); err != nil {
-		s.removeDragTemp(directory)
-		return "", err
-	}
-	files, err := prepareRemoteDownloadFiles(items)
-	if err != nil {
-		s.removeDragTemp(directory)
-		return "", err
-	}
-	defer cleanupRemoteDownloadFiles(files)
-	defer closeRemoteDownloadFiles(files)
-	sshClients, sftpClients = s.expandDownloadSFTPClients(
-		ctx,
-		conn,
-		sshClients,
-		sftpClients,
-		remoteDownloadConnectionWanted(files),
-	)
-	if err := s.downloadRemoteFiles(ctx, sftpClients, files, ""); err != nil {
-		s.removeDragTemp(directory)
-		return "", err
-	}
-	if err := finalizeRemoteDownloadFiles(files); err != nil {
-		s.removeDragTemp(directory)
-		return "", err
-	}
-	time.AfterFunc(30*time.Minute, func() { s.removeDragTemp(directory) })
-	return target, nil
 }
 
 type remoteTreeItem struct {

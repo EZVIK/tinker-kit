@@ -130,7 +130,6 @@ import {
   GetSSHConnections,
   ListRemoteFiles,
   OperateRemoteFiles,
-  PrepareFileForDrag,
   ResolveRemoteFileTask,
   SaveSSHFileConfig,
   SearchRemoteFiles,
@@ -751,8 +750,6 @@ export default function SshFilesTool({ active }: Props) {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [favoritesSaving, setFavoritesSaving] = useState(false);
   const [missingFavoritePath, setMissingFavoritePath] = useState<MissingFavoritePath | null>(null);
-  const [dragReady, setDragReady] = useState<{ remote: string; local: string } | null>(null);
-  const [dragPreparing, setDragPreparing] = useState('');
   const refreshedUploadTasks = useRef(new Set<string>());
   const refreshedOperationTasks = useRef(new Set<string>());
   const notifiedTaskFailures = useRef(new Set<string>());
@@ -1878,16 +1875,6 @@ export default function SshFilesTool({ active }: Props) {
     }
   };
 
-  const prepareDrag = (entry: RemoteFileEntry) => {
-    if (!sourceID) return;
-    setDragReady(null);
-    setDragPreparing(entry.path);
-    void PrepareFileForDrag(sourceID, entry.path)
-      .then((local) => setDragReady({ remote: entry.path, local }))
-      .catch(() => undefined)
-      .finally(() => setDragPreparing(''));
-  };
-
   const activeTasks = tasks.filter(
     (task) => task.status === 'queued' || task.status === 'running' || task.status === 'scanning',
   );
@@ -1939,7 +1926,6 @@ export default function SshFilesTool({ active }: Props) {
       ),
     [tasks],
   );
-  const readyDragPath = dragReady;
   const availableConnections =
     connectionDraft.id && !connections.some((item) => item.id === connectionDraft.id)
       ? [...connections, connectionDraft]
@@ -2583,45 +2569,10 @@ export default function SshFilesTool({ active }: Props) {
                         <ContextMenuTrigger
                           render={
                             <TableRow
-                              draggable
-                              aria-busy={dragPreparing === entry.path}
                               data-state={selected.includes(entry.path) ? 'selected' : undefined}
                               className="group select-none border-border/60"
                               onContextMenu={() => {
                                 if (!selected.includes(entry.path)) setSelected([entry.path]);
-                              }}
-                              onPointerDown={(event) => {
-                                if (event.button !== 0) return;
-                                const target = event.target as HTMLElement;
-                                if (!target.closest('button, input')) prepareDrag(entry);
-                              }}
-                              onDragStart={(event) => {
-                                event.dataTransfer.effectAllowed = 'copy';
-                                const local =
-                                  readyDragPath?.remote === entry.path ? readyDragPath.local : '';
-                                if (!local) {
-                                  event.preventDefault();
-                                  toast.add({
-                                    title: t('sshFilesTool.dragPreparing'),
-                                    type: 'info',
-                                  });
-                                  return;
-                                }
-                                const uri = new URL(`file://${local}`).href;
-                                event.dataTransfer.setData('text/uri-list', `${uri}\r\n`);
-                                event.dataTransfer.setData(
-                                  'DownloadURL',
-                                  `application/octet-stream:${entry.name}:${uri}`,
-                                );
-                                event.dataTransfer.setData('text/plain', local);
-                                event.dataTransfer.setData(
-                                  'application/x-tinkerkit-remote-file',
-                                  JSON.stringify({ sourceID, path: entry.path }),
-                                );
-                              }}
-                              onDragEnd={() => {
-                                setDragReady(null);
-                                setDragPreparing('');
                               }}
                             />
                           }

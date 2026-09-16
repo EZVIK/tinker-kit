@@ -21,8 +21,6 @@ type FileService struct {
 	taskOrder    []string
 	taskRevision uint64
 	emitEvent    func(string, any)
-	dragTempMu   sync.Mutex
-	dragTemps    map[string]struct{}
 }
 
 const maxImageFileSize = 10 * 1024 * 1024
@@ -40,24 +38,11 @@ func NewFileService(config ...*ConfigService) *FileService {
 	if len(config) > 0 {
 		service.config = config[0]
 	}
-	cleanupSSHDragTemps()
 	return service
 }
 
 func (s *FileService) ServiceName() string { return "FileService" }
 
-func (s *FileService) cleanup() {
-	s.dragTempMu.Lock()
-	paths := make([]string, 0, len(s.dragTemps))
-	for path := range s.dragTemps {
-		paths = append(paths, path)
-	}
-	s.dragTemps = nil
-	s.dragTempMu.Unlock()
-	for _, path := range paths {
-		_ = os.RemoveAll(path)
-	}
-}
 
 // SaveText 打开原生保存对话框，并将文本以 UTF-8 写入用户选择的路径。
 // 返回实际保存路径；用户取消时返回空路径和 nil error。

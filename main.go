@@ -139,7 +139,7 @@ func main() {
 	updateService.start(app.Updater, cfgService.Get().AutoCheckUpdates)
 	app.OnShutdown(updateService.stopScheduler)
 	app.OnShutdown(imageService.shutdown)
-	app.OnShutdown(fileService.cleanup)
+
 
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             appName,

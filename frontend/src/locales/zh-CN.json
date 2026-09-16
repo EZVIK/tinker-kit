@@ -1028,7 +1028,6 @@
     "addSource": "新增文件源",
     "chooseUpload": "选择要上传的文件或文件夹",
     "choose": "选择",
-    "dragPreparing": "文件正在准备，请稍后再拖动",
     "manageTitle": "管理 SSH 文件源",
     "manageDesc": "一个 SSH 连接可以对应多个文件源。",
     "backToList": "返回列表",
