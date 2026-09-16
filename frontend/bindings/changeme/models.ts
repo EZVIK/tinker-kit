@@ -64,6 +64,11 @@ export interface DockerImage {
     "createdAt": string;
 }
 
+export interface DockerImageBatchResult {
+    "succeeded": string[] | null;
+    "failed": DockerImageOperationFailure[] | null;
+}
+
 export interface DockerImageDetail {
     "id": string;
     "name": string;
@@ -105,6 +110,20 @@ export interface DockerImageMetadata {
     "configDigest": string;
     "rootfsType": string;
     "diffIDs": string[] | null;
+}
+
+export interface DockerImageOperationFailure {
+    "image": string;
+    "error": string;
+}
+
+/**
+ * DockerImageReferenceChange 描述一个镜像引用变更。Source 和 Target
+ * 都是传给 Docker CLI 的独立镜像引用，不经过 shell 拼接。
+ */
+export interface DockerImageReferenceChange {
+    "source": string;
+    "target": string;
 }
 
 export interface DockerOperationResult {

@@ -198,6 +198,23 @@ type DockerOperationResult struct {
 	Error   string `json:"error"`
 }
 
+// DockerImageReferenceChange 描述一个镜像引用变更。Source 和 Target
+// 都是传给 Docker CLI 的独立镜像引用，不经过 shell 拼接。
+type DockerImageReferenceChange struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+}
+
+type DockerImageOperationFailure struct {
+	Image string `json:"image"`
+	Error string `json:"error"`
+}
+
+type DockerImageBatchResult struct {
+	Succeeded []string                      `json:"succeeded"`
+	Failed    []DockerImageOperationFailure `json:"failed"`
+}
+
 type DockerDeleteFailure struct {
 	ImageID string `json:"imageID"`
 	Error   string `json:"error"`
@@ -2528,6 +2545,152 @@ func (s *ImageService) PushDockerImage(sourceID string, image string) (DockerOpe
 	}
 	result.Success = true
 	return result, nil
+}
+
+const maxDockerImageOperations = 100
+
+func emptyDockerImageBatchResult() DockerImageBatchResult {
+	return DockerImageBatchResult{
+		Succeeded: []string{},
+		Failed:    []DockerImageOperationFailure{},
+	}
+}
+
+func normalizeImageReferenceChanges(changes []DockerImageReferenceChange) []DockerImageReferenceChange {
+	unique := make([]DockerImageReferenceChange, 0, len(changes))
+	seen := make(map[string]struct{}, len(changes))
+	for _, change := range changes {
+		change.Source = strings.TrimSpace(change.Source)
+		change.Target = strings.TrimSpace(change.Target)
+		key := change.Source + "\x00" + change.Target
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, change)
+	}
+	return unique
+}
+
+func validMutableImageReference(reference string) bool {
+	return validImageReference(reference) && !strings.Contains(reference, "<none>") && !strings.Contains(reference, "@")
+}
+
+func (s *ImageService) dockerMutationSource(sourceID string) (ImageSource, string, string, error) {
+	source, cliPath, fingerprint, err := s.sourceSnapshot(sourceID)
+	if err != nil {
+		return ImageSource{}, "", "", err
+	}
+	if source.Kind == "registry" {
+		return ImageSource{}, "", "", errors.New("Registry 来源不支持 Docker 镜像变更")
+	}
+	return source, cliPath, fingerprint, nil
+}
+
+func appendDockerImageBatchFailure(result *DockerImageBatchResult, image, errText string) {
+	result.Failed = append(result.Failed, DockerImageOperationFailure{Image: image, Error: errText})
+}
+
+// TagDockerImages 创建镜像 Tag；removeSource 为 true 时，在创建目标 Tag 成功后删除源 Tag。
+// 该方法用于“复制到新 Tag”和“重命名”，会返回逐项部分成功结果。
+func (s *ImageService) TagDockerImages(sourceID string, changes []DockerImageReferenceChange, removeSource bool) DockerImageBatchResult {
+	result := emptyDockerImageBatchResult()
+	changes = normalizeImageReferenceChanges(changes)
+	if len(changes) == 0 {
+		return result
+	}
+	s.watchDeleteMu.Lock()
+	defer s.watchDeleteMu.Unlock()
+	s.watchMutationMu.Lock()
+	defer s.watchMutationMu.Unlock()
+	source, cliPath, fingerprint, sourceErr := s.dockerMutationSource(sourceID)
+	if sourceErr != nil {
+		for _, change := range changes {
+			appendDockerImageBatchFailure(&result, change.Source, sourceErr.Error())
+		}
+		return result
+	}
+	if len(changes) > maxDockerImageOperations {
+		for _, change := range changes[maxDockerImageOperations:] {
+			appendDockerImageBatchFailure(&result, change.Source, "超过镜像操作数量限制")
+		}
+		changes = changes[:maxDockerImageOperations]
+	}
+	for _, change := range changes {
+		if !validMutableImageReference(change.Source) || !validMutableImageReference(change.Target) {
+			appendDockerImageBatchFailure(&result, change.Source, "镜像引用无效")
+			continue
+		}
+		if change.Source == change.Target {
+			appendDockerImageBatchFailure(&result, change.Source, "目标 Tag 与当前镜像相同")
+			continue
+		}
+		if !s.sourceFingerprintCurrent(sourceID, fingerprint) {
+			appendDockerImageBatchFailure(&result, change.Source, "来源配置已变化，请刷新后重试")
+			continue
+		}
+		if _, err := s.runDockerSnapshot(source, cliPath, []string{"image", "tag", change.Source, change.Target}, imageCommandTimeout); err != nil {
+			appendDockerImageBatchFailure(&result, change.Source, err.Error())
+			continue
+		}
+		if removeSource {
+			if _, err := s.runDockerSnapshot(source, cliPath, []string{"image", "rm", change.Source}, imageCommandTimeout); err != nil {
+				appendDockerImageBatchFailure(&result, change.Source, fmt.Sprintf("目标 Tag 已创建，但删除旧 Tag 失败: %v", err))
+				continue
+			}
+		}
+		result.Succeeded = append(result.Succeeded, change.Target)
+	}
+	return result
+}
+
+// PushDockerImages 推送镜像。Source 与 Target 不同时先创建目标 Tag，再推送目标 Tag。
+// Source 与 Target 相同时直接推送当前镜像名称。
+func (s *ImageService) PushDockerImages(sourceID string, changes []DockerImageReferenceChange) DockerImageBatchResult {
+	result := emptyDockerImageBatchResult()
+	changes = normalizeImageReferenceChanges(changes)
+	if len(changes) == 0 {
+		return result
+	}
+	s.watchDeleteMu.Lock()
+	defer s.watchDeleteMu.Unlock()
+	s.watchMutationMu.Lock()
+	defer s.watchMutationMu.Unlock()
+	source, cliPath, fingerprint, sourceErr := s.dockerMutationSource(sourceID)
+	if sourceErr != nil {
+		for _, change := range changes {
+			appendDockerImageBatchFailure(&result, change.Source, sourceErr.Error())
+		}
+		return result
+	}
+	if len(changes) > maxDockerImageOperations {
+		for _, change := range changes[maxDockerImageOperations:] {
+			appendDockerImageBatchFailure(&result, change.Source, "超过镜像操作数量限制")
+		}
+		changes = changes[:maxDockerImageOperations]
+	}
+	for _, change := range changes {
+		if !validMutableImageReference(change.Source) || !validMutableImageReference(change.Target) {
+			appendDockerImageBatchFailure(&result, change.Source, "镜像引用无效")
+			continue
+		}
+		if !s.sourceFingerprintCurrent(sourceID, fingerprint) {
+			appendDockerImageBatchFailure(&result, change.Source, "来源配置已变化，请刷新后重试")
+			continue
+		}
+		if change.Source != change.Target {
+			if _, err := s.runDockerSnapshot(source, cliPath, []string{"image", "tag", change.Source, change.Target}, imageCommandTimeout); err != nil {
+				appendDockerImageBatchFailure(&result, change.Source, err.Error())
+				continue
+			}
+		}
+		if _, err := s.runDockerSnapshot(source, cliPath, []string{"image", "push", change.Target}, imagePushTimeout); err != nil {
+			appendDockerImageBatchFailure(&result, change.Source, err.Error())
+			continue
+		}
+		result.Succeeded = append(result.Succeeded, change.Target)
+	}
+	return result
 }
 
 func (s *ImageService) DeleteDockerImages(sourceID string, targets []DockerDeleteTarget) DockerDeleteResult {

@@ -15,23 +15,26 @@ import {
   PencilSimple,
   Plus,
   Trash,
+  UploadSimple,
 } from '@phosphor-icons/react';
 import {
   DeleteDockerImages,
   CancelImageTask,
   GetImageTasks,
   GetSSHConfigHosts,
-  PushDockerImage,
+  PushDockerImages,
   RefreshDockerImages,
   RetryImageExport,
   StartImageExport,
   StartImageExports,
+  TagDockerImages,
   TestImageSourceConnection,
   WatchDockerImages,
 } from '../../bindings/changeme/imageservice';
 import { ValidateImageSource } from '../../bindings/changeme/configservice';
 import type {
   Config as Settings,
+  DockerImageBatchResult,
   DockerImage,
   DockerImageDetail,
   DockerDeleteTarget,
@@ -63,8 +66,15 @@ import {
 } from './ui/alert-dialog';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
-import { ButtonGroup } from './ui/button-group';
 import { Checkbox } from './ui/checkbox';
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuGroup,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from './ui/context-menu';
 import {
   Dialog,
   DialogContent,
@@ -78,6 +88,7 @@ import {
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from './ui/dropdown-menu';
 import { Input } from './ui/input';
@@ -152,16 +163,28 @@ type WatchDockerImagesEvent = {
   error?: string;
 };
 
-type ConfirmState =
-  | { type: 'push'; image: DockerImage }
+type ConfirmState = {
+  type: 'delete';
+  ids: string[];
+  targets: DockerDeleteTarget[];
+  name: string;
+  sourceId: string;
+  sourceKind: string;
+  sourceConfigKey: string;
+} | null;
+
+type ImageOperationDialogState =
   | {
-      type: 'delete';
-      ids: string[];
-      targets: DockerDeleteTarget[];
-      name: string;
-      sourceId: string;
-      sourceKind: string;
+      type: 'push' | 'rename';
+      changes: Array<{ source: string; target: string }>;
       sourceConfigKey: string;
+      value: string;
+    }
+  | {
+      type: 'copy-tag';
+      images: DockerImage[];
+      sourceConfigKey: string;
+      value: string;
     }
   | null;
 
@@ -367,6 +390,25 @@ function shortId(id: string) {
 
 function imageLabel(image: DockerImage, unnamed: string) {
   return image.name?.trim() || unnamed;
+}
+
+function isNamedImageReference(image: DockerImage, unnamed: string) {
+  const name = imageLabel(image, unnamed);
+  return Boolean(name) && name !== unnamed && !name.includes('<none>') && !name.includes('@');
+}
+
+function imageExportReference(image: DockerImage, unnamed: string) {
+  return isNamedImageReference(image, unnamed) ? imageLabel(image, unnamed) : image.id;
+}
+
+function imageRepository(reference: string) {
+  const lastSlash = reference.lastIndexOf('/');
+  const lastColon = reference.lastIndexOf(':');
+  return lastColon > lastSlash ? reference.slice(0, lastColon) : reference;
+}
+
+function imageWithTag(reference: string, tag: string) {
+  return `${imageRepository(reference)}:${tag}`;
 }
 
 function copyableImageName(source: ImageSource, image: DockerImage, unnamed: string) {
@@ -911,7 +953,7 @@ export default function ImageManagerTool({
   const [watchSourceId, setWatchSourceId] = useState<string | null>(null);
   const [images, setImages] = useState<DockerImage[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [busy, setBusy] = useState<'push' | 'delete' | null>(null);
+  const [busy, setBusy] = useState<'push' | 'tag' | 'delete' | null>(null);
   const [manageOpen, setManageOpen] = useState(false);
   const [manageTab, setManageTab] = useState<'ssh' | 'registry'>('ssh');
   const [editingSource, setEditingSource] = useState<SourceDraft | null>(null);
@@ -927,6 +969,8 @@ export default function ImageManagerTool({
   const [hostsLoading, setHostsLoading] = useState(false);
   const [hostsError, setHostsError] = useState('');
   const [confirm, setConfirm] = useState<ConfirmState>(null);
+  const [operationDialog, setOperationDialog] = useState<ImageOperationDialogState>(null);
+  const [operationError, setOperationError] = useState('');
   const [search, setSearch] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('name');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
@@ -1202,6 +1246,12 @@ export default function ImageManagerTool({
     return next.map((item) => item.image);
   }, [i18n.language, indexedImages, search, sortDirection, sortKey]);
   const selectedCount = sourceIsChanging ? 0 : selected.size;
+  const selectedImages = sourceIsChanging
+    ? []
+    : filteredImages.filter((image) => selected.has(image.id));
+  const selectedNamedImages = selectedImages.filter((image) =>
+    isNamedImageReference(image, unnamed),
+  );
   const allSelected =
     filteredImages.length > 0 && filteredImages.every((image) => selected.has(image.id));
   const someSelected = filteredImages.some((image) => selected.has(image.id)) && !allSelected;
@@ -1226,6 +1276,12 @@ export default function ImageManagerTool({
   );
   const actionBlocked = isConnecting || busy !== null || sourceViewState === 'unavailable';
   const interactionBlocked = busy !== null;
+  const sourceSupportsDockerMutations = source.kind !== 'registry';
+  const sourceCanDelete = (source as ManagedImageSource).capabilities?.canDelete ?? true;
+  const selectedSupportsDockerMutations =
+    sourceSupportsDockerMutations &&
+    selectedImages.length > 0 &&
+    selectedNamedImages.length === selectedImages.length;
   const registryConfirmDigests =
     confirm?.type === 'delete' && confirm.sourceKind === 'registry'
       ? [
@@ -1654,20 +1710,46 @@ export default function ImageManagerTool({
     }
   };
 
-  const runPush = async (image: DockerImage) => {
+  const reportBatchResult = (result: DockerImageBatchResult, successKey: string) => {
+    const succeeded = result.succeeded ?? [];
+    const failures = result.failed ?? [];
+    if (failures.length > 0) {
+      toast.add({
+        title: t('imageManagerTool.operationPartial', {
+          succeeded: succeeded.length,
+          failed: failures.length,
+        }),
+        description: failures
+          .map((failure) =>
+            t('imageManagerTool.operationFailureReason', {
+              image: failure.image,
+              reason: failure.error,
+            }),
+          )
+          .join('\n'),
+        type: succeeded.length > 0 ? 'warning' : 'error',
+      });
+    } else {
+      toast.add({ title: t(successKey) });
+    }
+    return { succeeded, failures };
+  };
+
+  const runPushChanges = async (changes: Array<{ source: string; target: string }>) => {
     setBusy('push');
     try {
-      const result = await PushDockerImage(source.id, image.name || image.id);
-      if (!result.success) {
-        toast.add({
-          title: t('imageManagerTool.actionFailed'),
-          description: result.error || undefined,
-          type: 'error',
-        });
-        return;
+      const result = await PushDockerImages(source.id, changes);
+      const { succeeded, failures } = reportBatchResult(result, 'imageManagerTool.pushed');
+      if (succeeded.length > 0 || changes.some((change) => change.source !== change.target)) {
+        requestWatchReload();
       }
-      toast.add({ title: t('imageManagerTool.pushed') });
-      record('image-manager', t('imageManagerTool.push'), imageLabel(image, unnamed), image.id);
+      if (failures.length === 0) setSelected(new Set());
+      record(
+        'image-manager',
+        t('imageManagerTool.push'),
+        changes.map((change) => `${change.source} → ${change.target}`).join('\n'),
+        source.id,
+      );
     } catch (error) {
       toast.add({
         title: t('imageManagerTool.actionFailed'),
@@ -1676,8 +1758,138 @@ export default function ImageManagerTool({
       });
     } finally {
       setBusy(null);
-      setConfirm(null);
+      setOperationDialog(null);
     }
+  };
+
+  const runTagChanges = async (
+    changes: Array<{ source: string; target: string }>,
+    removeSource: boolean,
+  ) => {
+    setBusy('tag');
+    try {
+      const result = await TagDockerImages(source.id, changes, removeSource);
+      const { succeeded, failures } = reportBatchResult(
+        result,
+        removeSource ? 'imageManagerTool.renamed' : 'imageManagerTool.copiedToTag',
+      );
+      if (succeeded.length > 0 || failures.length > 0) requestWatchReload();
+      if (failures.length === 0) setSelected(new Set());
+      record(
+        'image-manager',
+        t(removeSource ? 'imageManagerTool.rename' : 'imageManagerTool.copyTagAction'),
+        changes.map((change) => `${change.source} → ${change.target}`).join('\n'),
+        source.id,
+      );
+    } catch (error) {
+      toast.add({
+        title: t('imageManagerTool.actionFailed'),
+        description: errorMessage(error) || undefined,
+        type: 'error',
+      });
+    } finally {
+      setBusy(null);
+      setOperationDialog(null);
+    }
+  };
+
+  const operationImagesFor = (image: DockerImage) =>
+    selected.has(image.id) ? selectedImages : [image];
+
+  const openPushDialog = (images: DockerImage[]) => {
+    if (
+      actionBlocked ||
+      !sourceSupportsDockerMutations ||
+      images.length === 0 ||
+      images.some((image) => !isNamedImageReference(image, unnamed))
+    ) {
+      return;
+    }
+    setOperationError('');
+    setOperationDialog({
+      type: 'push',
+      changes: images.map((image) => {
+        const name = imageLabel(image, unnamed);
+        return { source: name, target: name };
+      }),
+      sourceConfigKey,
+      value: images.length === 1 ? imageLabel(images[0], unnamed) : '',
+    });
+  };
+
+  const openRenameDialog = (image: DockerImage) => {
+    if (actionBlocked || !sourceSupportsDockerMutations || !isNamedImageReference(image, unnamed)) {
+      return;
+    }
+    const name = imageLabel(image, unnamed);
+    setOperationError('');
+    setOperationDialog({
+      type: 'rename',
+      changes: [{ source: name, target: name }],
+      sourceConfigKey,
+      value: name,
+    });
+  };
+
+  const openCopyTagDialog = (images: DockerImage[]) => {
+    if (
+      actionBlocked ||
+      !sourceSupportsDockerMutations ||
+      images.length === 0 ||
+      images.some((image) => !isNamedImageReference(image, unnamed))
+    ) {
+      return;
+    }
+    setOperationError('');
+    setOperationDialog({ type: 'copy-tag', images, sourceConfigKey, value: '' });
+  };
+
+  const submitOperation = () => {
+    if (!operationDialog || busy) return;
+    if (operationDialog.sourceConfigKey !== sourceConfigKey) {
+      toast.add({ title: t('imageManagerTool.sourceChangedRefresh'), type: 'warning' });
+      setOperationDialog(null);
+      return;
+    }
+    const value = operationDialog.value.trim();
+    if (operationDialog.type === 'push') {
+      if (operationDialog.changes.length === 1) {
+        if (!value) {
+          setOperationError(t('imageManagerTool.operationInputRequired'));
+          return;
+        }
+        if (value === operationDialog.changes[0].source) {
+          void runPushChanges(operationDialog.changes);
+        } else {
+          void runPushChanges([{ source: operationDialog.changes[0].source, target: value }]);
+        }
+        return;
+      }
+      void runPushChanges(operationDialog.changes);
+      return;
+    }
+    if (operationDialog.type === 'rename') {
+      if (!value) {
+        setOperationError(t('imageManagerTool.operationInputRequired'));
+        return;
+      }
+      if (value === operationDialog.changes[0].source) {
+        setOperationError(t('imageManagerTool.operationTargetUnchanged'));
+        return;
+      }
+      void runTagChanges([{ source: operationDialog.changes[0].source, target: value }], true);
+      return;
+    }
+    if (!value) {
+      setOperationError(t('imageManagerTool.operationInputRequired'));
+      return;
+    }
+    if (operationDialog.type !== 'copy-tag') return;
+    const changes = operationDialog.images.map((image) => {
+      const sourceName = imageLabel(image, unnamed);
+      return { source: sourceName, target: imageWithTag(sourceName, value) };
+    });
+    void runTagChanges(changes, false);
   };
 
   const runDelete = async (
@@ -1725,8 +1937,7 @@ export default function ImageManagerTool({
 
   const confirmAction = () => {
     if (!confirm || busy) return;
-    if (confirm.type === 'push') void runPush(confirm.image);
-    else if (confirm.sourceConfigKey !== sourceConfigKey) {
+    if (confirm.sourceConfigKey !== sourceConfigKey) {
       toast.add({ title: t('imageManagerTool.sourceChangedRefresh'), type: 'warning' });
       setConfirm(null);
     } else void runDelete(confirm.sourceId, confirm.ids, confirm.targets, confirm.name);
@@ -1803,10 +2014,9 @@ export default function ImageManagerTool({
       total: task.total,
     });
   };
-  const runBatchExport = async () => {
-    const selectedImages = filteredImages.filter((image) => selected.has(image.id));
-    const imageIDs = selectedImages.map((image) => image.name || image.id);
-    const estimatedSizes = selectedImages.map(imageExportEstimateBytes);
+  const runBatchExport = async (requestedImages = selectedImages) => {
+    const imageIDs = requestedImages.map((image) => imageExportReference(image, unnamed));
+    const estimatedSizes = requestedImages.map(imageExportEstimateBytes);
     if (imageIDs.length === 0 || batchExportStarting) return;
     setBatchExportStarting(true);
     try {
@@ -1835,7 +2045,7 @@ export default function ImageManagerTool({
     try {
       const result = await StartImageExport(
         source.id,
-        image.name || image.id,
+        imageExportReference(image, unnamed),
         imageExportEstimateBytes(image),
       );
       if (result.started > 0) {
@@ -1995,7 +2205,7 @@ export default function ImageManagerTool({
             </div>
           ) : (
             <div className="min-h-0 flex-1 overflow-auto overscroll-contain [padding-inline-end:var(--overlay-scrollbar-hit-size)]">
-              <Table className="min-w-[760px]" containerClassName="overflow-visible">
+              <Table className="min-w-[640px]" containerClassName="overflow-visible">
                 <TableHeader className="sticky top-0 z-10 bg-background">
                   <TableRow>
                     <TableHead className="w-10 whitespace-nowrap">
@@ -2045,142 +2255,160 @@ export default function ImageManagerTool({
                     >
                       {sortableHeader('createdAt', t('imageManagerTool.columnCreated'))}
                     </TableHead>
-                    <TableHead className="w-32 whitespace-nowrap text-right">
-                      {t('imageManagerTool.columnActions')}
-                    </TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredImages.map((image) => (
-                    <TableRow
-                      key={image.id}
-                      data-state={selected.has(image.id) ? 'selected' : undefined}
-                    >
-                      <TableCell
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <Checkbox
-                          checked={selected.has(image.id)}
-                          onCheckedChange={(checked) => toggleRow(image.id, checked === true)}
-                          aria-label={t('imageManagerTool.selectRow')}
-                        />
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap">
-                        <span className="font-mono text-[12px]" title={image.id}>
-                          {source.kind === 'registry'
-                            ? image.digest
-                              ? shortId(image.digest)
-                              : t('imageManagerTool.emptyValue')
-                            : shortId(image.id)}
-                        </span>
-                      </TableCell>
-                      <TableCell className="min-w-40">
-                        <button
-                          type="button"
-                          className="inline-flex min-w-0 max-w-full cursor-pointer truncate text-left text-foreground hover:text-primary hover:underline hover:underline-offset-4 disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={interactionBlocked}
-                          title={t('imageManagerTool.viewName', {
-                            name: imageLabel(image, unnamed),
-                          })}
-                          aria-label={t('imageManagerTool.viewName', {
-                            name: imageLabel(image, unnamed),
-                          })}
-                          onClick={() => void viewImage(image)}
+                  {filteredImages.map((image) => {
+                    const operationImages = operationImagesFor(image);
+                    const operationAllowed =
+                      sourceSupportsDockerMutations &&
+                      operationImages.length > 0 &&
+                      operationImages.every((item) => isNamedImageReference(item, unnamed));
+                    return (
+                      <ContextMenu key={image.id}>
+                        <ContextMenuTrigger
+                          render={
+                            <TableRow
+                              data-state={selected.has(image.id) ? 'selected' : undefined}
+                              className="select-none border-border/60"
+                              onContextMenu={() => {
+                                if (!selected.has(image.id)) setSelected(new Set([image.id]));
+                              }}
+                            />
+                          }
                         >
-                          <span className="truncate">{imageLabel(image, unnamed)}</span>
-                        </button>
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {formatBytes(imageSizeBytes(image), i18n.language) ||
-                          t('imageManagerTool.emptyValue')}
-                      </TableCell>
-                      <TableCell
-                        className="whitespace-nowrap text-muted-foreground"
-                        title={formatCreatedAt(image.createdAt, i18n.language)}
-                      >
-                        {formatCreatedAtCompact(image.createdAt, i18n.language)}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap text-right">
-                        <ButtonGroup
-                          className="ml-auto flex-none"
-                          aria-label={t('imageManagerTool.rowActions')}
-                        >
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={interactionBlocked}
-                            onClick={() => void viewImage(image)}
+                          <TableCell
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
                           >
-                            {t('imageManagerTool.view')}
-                          </Button>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger
+                            <Checkbox
+                              checked={selected.has(image.id)}
+                              onCheckedChange={(checked) => toggleRow(image.id, checked === true)}
+                              aria-label={t('imageManagerTool.selectRow')}
+                            />
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap">
+                            <span className="font-mono text-[12px]" title={image.id}>
+                              {source.kind === 'registry'
+                                ? image.digest
+                                  ? shortId(image.digest)
+                                  : t('imageManagerTool.emptyValue')
+                                : shortId(image.id)}
+                            </span>
+                          </TableCell>
+                          <TableCell className="min-w-40">
+                            <button
+                              type="button"
+                              className="inline-flex min-w-0 max-w-full cursor-pointer truncate text-left text-foreground hover:text-primary hover:underline hover:underline-offset-4 disabled:cursor-not-allowed disabled:opacity-50"
                               disabled={interactionBlocked}
-                              render={
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  aria-label={t('imageManagerTool.moreActions')}
-                                />
+                              title={t('imageManagerTool.viewName', {
+                                name: imageLabel(image, unnamed),
+                              })}
+                              aria-label={t('imageManagerTool.viewName', {
+                                name: imageLabel(image, unnamed),
+                              })}
+                              onClick={() => void viewImage(image)}
+                            >
+                              <span className="truncate">{imageLabel(image, unnamed)}</span>
+                            </button>
+                          </TableCell>
+                          <TableCell className="whitespace-nowrap text-muted-foreground">
+                            {formatBytes(imageSizeBytes(image), i18n.language) ||
+                              t('imageManagerTool.emptyValue')}
+                          </TableCell>
+                          <TableCell
+                            className="whitespace-nowrap text-muted-foreground"
+                            title={formatCreatedAt(image.createdAt, i18n.language)}
+                          >
+                            {formatCreatedAtCompact(image.createdAt, i18n.language)}
+                          </TableCell>
+                        </ContextMenuTrigger>
+                        <ContextMenuContent className="min-w-48">
+                          <ContextMenuGroup>
+                            <ContextMenuItem
+                              disabled={interactionBlocked}
+                              onClick={() =>
+                                void copyImageName(copyableImageName(source, image, unnamed))
                               }
                             >
-                              <CaretDown weight="duotone" />
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="min-w-32">
-                              <DropdownMenuGroup>
-                                <DropdownMenuItem
-                                  onClick={() =>
-                                    void copyImageName(copyableImageName(source, image, unnamed))
-                                  }
-                                >
-                                  {copiedName === copyableImageName(source, image, unnamed)
-                                    ? t('imageManagerTool.copied')
-                                    : t('imageManagerTool.copyName')}
-                                </DropdownMenuItem>
-                                <DropdownMenuItem
-                                  disabled={actionBlocked}
-                                  onClick={() => void runExport(image)}
-                                >
-                                  <DownloadSimple data-icon="inline-start" weight="duotone" />
-                                  {t('imageManagerTool.exportTar')}
-                                </DropdownMenuItem>
-                                {((source as ManagedImageSource).capabilities?.canPush ??
-                                source.kind !== 'registry') ? (
-                                  <DropdownMenuItem
-                                    disabled={actionBlocked}
-                                    onClick={() => setConfirm({ type: 'push', image })}
-                                  >
-                                    {t('imageManagerTool.push')}
-                                  </DropdownMenuItem>
-                                ) : null}
-                                {((source as ManagedImageSource).capabilities?.canDelete ??
-                                true) ? (
-                                  <DropdownMenuItem
-                                    variant="destructive"
-                                    disabled={actionBlocked}
-                                    onClick={() =>
-                                      setConfirm({
-                                        type: 'delete',
-                                        ids: [image.id],
-                                        targets: deleteTargets(images, [image.id]),
-                                        name: imageLabel(image, unnamed),
-                                        sourceId: source.id,
-                                        sourceKind: source.kind,
-                                        sourceConfigKey,
+                              <Copy data-icon="inline-start" weight="duotone" />
+                              {copiedName === copyableImageName(source, image, unnamed)
+                                ? t('imageManagerTool.copied')
+                                : t('imageManagerTool.copyName')}
+                            </ContextMenuItem>
+                          </ContextMenuGroup>
+                          <ContextMenuSeparator />
+                          <ContextMenuGroup>
+                            <ContextMenuItem
+                              disabled={actionBlocked}
+                              onClick={() =>
+                                operationImages.length === 1
+                                  ? void runExport(operationImages[0])
+                                  : void runBatchExport(operationImages)
+                              }
+                            >
+                              <DownloadSimple data-icon="inline-start" weight="duotone" />
+                              {operationImages.length > 1
+                                ? t('imageManagerTool.batchExport')
+                                : t('imageManagerTool.exportTar')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={actionBlocked || !operationAllowed}
+                              onClick={() => openPushDialog(operationImages)}
+                            >
+                              <UploadSimple data-icon="inline-start" weight="duotone" />
+                              {t('imageManagerTool.pushRemote')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={
+                                actionBlocked || !operationAllowed || operationImages.length !== 1
+                              }
+                              onClick={() => openRenameDialog(image)}
+                            >
+                              <PencilSimple data-icon="inline-start" weight="duotone" />
+                              {t('imageManagerTool.rename')}
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              disabled={actionBlocked || !operationAllowed}
+                              onClick={() => openCopyTagDialog(operationImages)}
+                            >
+                              <Copy data-icon="inline-start" weight="duotone" />
+                              {t('imageManagerTool.copyTagAction')}
+                            </ContextMenuItem>
+                          </ContextMenuGroup>
+                          <ContextMenuSeparator />
+                          <ContextMenuItem
+                            variant="destructive"
+                            disabled={actionBlocked || !sourceCanDelete}
+                            onClick={() =>
+                              setConfirm({
+                                type: 'delete',
+                                ids: operationImages.map((item) => item.id),
+                                targets: deleteTargets(
+                                  images,
+                                  operationImages.map((item) => item.id),
+                                ),
+                                name:
+                                  operationImages.length > 1
+                                    ? t('imageManagerTool.selectedCount', {
+                                        count: operationImages.length,
                                       })
-                                    }
-                                  >
-                                    {t('imageManagerTool.delete')}
-                                  </DropdownMenuItem>
-                                ) : null}
-                              </DropdownMenuGroup>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </ButtonGroup>
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                                    : imageLabel(image, unnamed),
+                                sourceId: source.id,
+                                sourceKind: source.kind,
+                                sourceConfigKey,
+                              })
+                            }
+                          >
+                            <Trash data-icon="inline-start" weight="duotone" />
+                            {operationImages.length > 1
+                              ? t('imageManagerTool.batchDelete')
+                              : t('imageManagerTool.delete')}
+                          </ContextMenuItem>
+                        </ContextMenuContent>
+                      </ContextMenu>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>
@@ -2240,46 +2468,203 @@ export default function ImageManagerTool({
                 </button>
               ) : null}
             </div>
-            <div className="flex flex-none flex-wrap items-center justify-end gap-2">
-              {selectedCount > 0 ? (
-                <Button
-                  variant="outline"
-                  className="h-[30px] flex-none px-[11px] text-[11px]"
-                  disabled={actionBlocked || batchExportStarting}
-                  onClick={() => void runBatchExport()}
+            <div className="flex min-h-[30px] flex-none flex-wrap items-center justify-end gap-2">
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      variant="outline"
+                      className={`h-[30px] flex-none px-[11px] text-[11px]${selectedCount > 0 ? '' : ' invisible pointer-events-none'}`}
+                      disabled={actionBlocked || selectedCount === 0}
+                      aria-hidden={selectedCount === 0}
+                      tabIndex={selectedCount > 0 ? 0 : -1}
+                    />
+                  }
                 >
-                  {batchExportStarting ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
-                    <DownloadSimple data-icon="inline-start" weight="duotone" />
-                  )}
-                  {t('imageManagerTool.batchExport')}
-                </Button>
-              ) : null}
-              <Button
-                variant="destructive"
-                className={`h-[30px] flex-none px-[11px] text-[11px]${selectedCount > 0 ? '' : ' invisible pointer-events-none'}`}
-                disabled={actionBlocked || selectedCount === 0}
-                aria-hidden={selectedCount === 0}
-                tabIndex={selectedCount > 0 ? 0 : -1}
-                onClick={() =>
-                  setConfirm({
-                    type: 'delete',
-                    ids: [...selected],
-                    targets: deleteTargets(images, [...selected]),
-                    name: t('imageManagerTool.selectedCount', { count: selectedCount }),
-                    sourceId: source.id,
-                    sourceKind: source.kind,
-                    sourceConfigKey,
-                  })
-                }
-              >
-                {busy === 'delete' ? <Spinner data-icon="inline-start" /> : null}
-                {t('imageManagerTool.batchDelete')}
-              </Button>
+                  <ListDashes data-icon="inline-start" size={14} />
+                  {t('imageManagerTool.batchActions')}
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-48">
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem
+                      disabled={actionBlocked || batchExportStarting}
+                      onClick={() => void runBatchExport()}
+                    >
+                      {batchExportStarting ? (
+                        <Spinner data-icon="inline-start" />
+                      ) : (
+                        <DownloadSimple data-icon="inline-start" weight="duotone" />
+                      )}
+                      {t('imageManagerTool.batchExport')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={actionBlocked || !selectedSupportsDockerMutations}
+                      onClick={() => openPushDialog(selectedImages)}
+                    >
+                      <UploadSimple data-icon="inline-start" weight="duotone" />
+                      {t('imageManagerTool.push')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={actionBlocked || !selectedSupportsDockerMutations}
+                      onClick={() => openCopyTagDialog(selectedImages)}
+                    >
+                      <Copy data-icon="inline-start" weight="duotone" />
+                      {t('imageManagerTool.copyTagAction')}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      variant="destructive"
+                      disabled={actionBlocked || selectedCount === 0 || !sourceCanDelete}
+                      onClick={() =>
+                        setConfirm({
+                          type: 'delete',
+                          ids: [...selected],
+                          targets: deleteTargets(images, [...selected]),
+                          name: t('imageManagerTool.selectedCount', { count: selectedCount }),
+                          sourceId: source.id,
+                          sourceKind: source.kind,
+                          sourceConfigKey,
+                        })
+                      }
+                    >
+                      <Trash data-icon="inline-start" weight="duotone" />
+                      {t('imageManagerTool.batchDelete')}
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
         </ToolLayoutFooter>
+        <Dialog
+          open={operationDialog !== null}
+          onOpenChange={(open) => {
+            if (!open && !busy) {
+              setOperationDialog(null);
+              setOperationError('');
+            }
+          }}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                {operationDialog?.type === 'push'
+                  ? operationDialog.changes.length > 1
+                    ? t('imageManagerTool.batchPushTitle')
+                    : t('imageManagerTool.pushTitle')
+                  : operationDialog?.type === 'rename'
+                    ? t('imageManagerTool.renameTitle')
+                    : t('imageManagerTool.copyTagTitle')}
+              </DialogTitle>
+              <DialogDescription>
+                {operationDialog?.type === 'push'
+                  ? operationDialog.changes.length > 1
+                    ? t('imageManagerTool.batchPushBody', {
+                        count: operationDialog.changes.length,
+                      })
+                    : t('imageManagerTool.pushBody')
+                  : operationDialog?.type === 'rename'
+                    ? t('imageManagerTool.renameBody', {
+                        name: operationDialog.changes[0]?.source ?? '',
+                      })
+                    : t('imageManagerTool.copyTagBody', {
+                        count:
+                          operationDialog?.type === 'copy-tag' ? operationDialog.images.length : 0,
+                      })}
+              </DialogDescription>
+            </DialogHeader>
+            {operationDialog?.type === 'push' && operationDialog.changes.length === 1 ? (
+              <div className="grid gap-2">
+                <Label htmlFor="image-operation-target">
+                  {t('imageManagerTool.targetImageName')}
+                </Label>
+                <Input
+                  id="image-operation-target"
+                  value={operationDialog.value}
+                  placeholder={operationDialog.changes[0]?.source}
+                  aria-invalid={Boolean(operationError)}
+                  onChange={(event) => {
+                    setOperationError('');
+                    setOperationDialog((current) =>
+                      current?.type === 'push'
+                        ? { ...current, value: event.target.value }
+                        : current,
+                    );
+                  }}
+                />
+              </div>
+            ) : null}
+            {operationDialog?.type === 'rename' ? (
+              <div className="grid gap-2">
+                <Label htmlFor="image-operation-target">
+                  {t('imageManagerTool.targetImageName')}
+                </Label>
+                <Input
+                  id="image-operation-target"
+                  value={operationDialog.value}
+                  aria-invalid={Boolean(operationError)}
+                  onChange={(event) => {
+                    setOperationError('');
+                    setOperationDialog((current) =>
+                      current?.type === 'rename'
+                        ? { ...current, value: event.target.value }
+                        : current,
+                    );
+                  }}
+                />
+              </div>
+            ) : null}
+            {operationDialog?.type === 'copy-tag' ? (
+              <div className="grid gap-2">
+                <Label htmlFor="image-operation-tag">{t('imageManagerTool.newTag')}</Label>
+                <Input
+                  id="image-operation-tag"
+                  value={operationDialog.value}
+                  placeholder={t('imageManagerTool.newTagPlaceholder')}
+                  aria-invalid={Boolean(operationError)}
+                  onChange={(event) => {
+                    setOperationError('');
+                    setOperationDialog((current) =>
+                      current?.type === 'copy-tag'
+                        ? { ...current, value: event.target.value }
+                        : current,
+                    );
+                  }}
+                />
+              </div>
+            ) : null}
+            {operationDialog?.type === 'push' && operationDialog.changes.length > 1 ? (
+              <div className="max-h-36 overflow-y-auto rounded-md border border-border bg-muted/40 px-3 py-2">
+                {operationDialog.changes.map((change) => (
+                  <code key={change.source} className="block break-all font-mono text-xs leading-5">
+                    {change.source}
+                  </code>
+                ))}
+              </div>
+            ) : null}
+            {operationError ? (
+              <p className="m-0 text-xs text-destructive" role="alert">
+                {operationError}
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={busy !== null}
+                onClick={() => {
+                  setOperationDialog(null);
+                  setOperationError('');
+                }}
+              >
+                {t('imageManagerTool.cancel')}
+              </Button>
+              <Button disabled={busy !== null} onClick={submitOperation}>
+                {busy ? <Spinner data-icon="inline-start" /> : null}
+                {t('imageManagerTool.confirm')}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
         <Dialog open={tasksOpen} onOpenChange={setTasksOpen}>
           <DialogContent className="max-w-lg">
             <DialogHeader>
@@ -2587,22 +2972,12 @@ export default function ImageManagerTool({
       >
         <AlertDialogContent className="min-w-0 max-w-[calc(100vw-2rem)] sm:max-w-md">
           <AlertDialogHeader className="min-w-0">
-            <AlertDialogTitle>
-              {confirm?.type === 'push'
-                ? t('imageManagerTool.pushConfirmTitle')
-                : t('imageManagerTool.deleteConfirmTitle')}
-            </AlertDialogTitle>
+            <AlertDialogTitle>{t('imageManagerTool.deleteConfirmTitle')}</AlertDialogTitle>
             <AlertDialogDescription
               render={<div />}
               className="min-w-0 max-w-full text-left whitespace-normal break-words [overflow-wrap:anywhere]"
             >
-              {confirm?.type === 'push' ? (
-                <p className="m-0">
-                  {t('imageManagerTool.pushConfirmBody', {
-                    name: imageLabel(confirm.image, unnamed),
-                  })}
-                </p>
-              ) : confirm?.type === 'delete' ? (
+              {confirm?.type === 'delete' ? (
                 confirm.sourceKind === 'registry' ? (
                   <div className="flex min-w-0 flex-col gap-3">
                     <p className="m-0">{t('imageManagerTool.registryDeleteConfirmSummary')}</p>
@@ -2685,7 +3060,7 @@ export default function ImageManagerTool({
               {t('imageManagerTool.cancel')}
             </AlertDialogCancel>
             <AlertDialogAction
-              variant={confirm?.type === 'delete' ? 'destructive' : 'default'}
+              variant="destructive"
               disabled={busy !== null}
               onClick={confirmAction}
             >

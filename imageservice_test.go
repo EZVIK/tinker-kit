@@ -248,6 +248,173 @@ func TestBuildImageCommandLocalAndSSH(t *testing.T) {
 	}
 }
 
+func TestTagDockerImagesRunsTagAndRenameInOrder(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	var calls [][]string
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{name}, args...))
+			return nil, nil
+		},
+	}
+	result := service.TagDockerImages("local", []DockerImageReferenceChange{{Source: "repo:old", Target: "repo:new"}}, true)
+	if !reflect.DeepEqual(result.Succeeded, []string{"repo:new"}) || len(result.Failed) != 0 {
+		t.Fatalf("重命名结果为 %#v", result)
+	}
+	want := [][]string{
+		{"docker", "image", "tag", "repo:old", "repo:new"},
+		{"docker", "image", "rm", "repo:old"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("重命名命令顺序为 %#v，期望 %#v", calls, want)
+	}
+}
+
+func TestTagDockerImagesUsesSSHCommandArguments(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "remote", Kind: "ssh", SSHHost: "dev-box"}}})}
+	var commandName string
+	var commandArgs []string
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			commandName = name
+			commandArgs = append([]string(nil), args...)
+			return nil, nil
+		},
+	}
+	result := service.TagDockerImages("remote", []DockerImageReferenceChange{{Source: "repo:old", Target: "repo:new"}}, false)
+	if !reflect.DeepEqual(result.Succeeded, []string{"repo:new"}) {
+		t.Fatalf("SSH Tag 结果为 %#v", result)
+	}
+	if commandName != "ssh" || !reflect.DeepEqual(commandArgs, []string{"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "--", "dev-box", "'docker' 'image' 'tag' 'repo:old' 'repo:new'"}) {
+		t.Fatalf("SSH Tag 命令为 %q %#v", commandName, commandArgs)
+	}
+}
+
+func TestTagDockerImagesCopyKeepsSourceTag(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	calls := 0
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			calls++
+			if !reflect.DeepEqual(args, []string{"image", "tag", "repo:old", "repo:new"}) {
+				t.Fatalf("复制 Tag 命令为 %#v", args)
+			}
+			return nil, nil
+		},
+	}
+	result := service.TagDockerImages("local", []DockerImageReferenceChange{{Source: "repo:old", Target: "repo:new"}}, false)
+	if calls != 1 || !reflect.DeepEqual(result.Succeeded, []string{"repo:new"}) || len(result.Failed) != 0 {
+		t.Fatalf("复制 Tag 结果为调用 %d、结果 %#v", calls, result)
+	}
+}
+
+func TestTagDockerImagesReportsOldTagDeleteFailure(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if len(args) == 3 && args[1] == "rm" {
+				return nil, errors.New("remove failed")
+			}
+			return nil, nil
+		},
+	}
+	result := service.TagDockerImages("local", []DockerImageReferenceChange{{Source: "repo:old", Target: "repo:new"}}, true)
+	if len(result.Succeeded) != 0 || len(result.Failed) != 1 || !strings.Contains(result.Failed[0].Error, "目标 Tag 已创建") {
+		t.Fatalf("旧 Tag 删除失败结果为 %#v", result)
+	}
+}
+
+func TestPushDockerImagesTagsTargetBeforePush(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	var calls [][]string
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{name}, args...))
+			return nil, nil
+		},
+	}
+	result := service.PushDockerImages("local", []DockerImageReferenceChange{{Source: "repo:old", Target: "registry.example/team/repo:release"}})
+	if !reflect.DeepEqual(result.Succeeded, []string{"registry.example/team/repo:release"}) || len(result.Failed) != 0 {
+		t.Fatalf("目标推送结果为 %#v", result)
+	}
+	want := [][]string{
+		{"docker", "image", "tag", "repo:old", "registry.example/team/repo:release"},
+		{"docker", "image", "push", "registry.example/team/repo:release"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("目标推送命令为 %#v，期望 %#v", calls, want)
+	}
+}
+
+func TestPushDockerImagesBatchDeduplicatesAndReturnsPartialResults(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	var calls [][]string
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{name}, args...))
+			if len(args) == 3 && args[0] == "image" && args[1] == "push" && args[2] == "bad:latest" {
+				return nil, errors.New("push failed")
+			}
+			return nil, nil
+		},
+	}
+	result := service.PushDockerImages("local", []DockerImageReferenceChange{
+		{Source: "good:latest", Target: "good:latest"},
+		{Source: "good:latest", Target: "good:latest"},
+		{Source: "bad:latest", Target: "bad:latest"},
+	})
+	if !reflect.DeepEqual(result.Succeeded, []string{"good:latest"}) || len(result.Failed) != 1 || result.Failed[0].Image != "bad:latest" {
+		t.Fatalf("批量推送部分结果为 %#v", result)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("重复镜像未去重，命令数为 %d", len(calls))
+	}
+}
+
+func TestImageMutationRejectsRegistryAndInvalidReferences(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "registry", Kind: "registry", RegistryURL: "https://registry.example"}}})}
+	service := &ImageService{config: config}
+	result := service.TagDockerImages("registry", []DockerImageReferenceChange{{Source: "repo:old", Target: "repo:new"}}, false)
+	if len(result.Failed) != 1 || !strings.Contains(result.Failed[0].Error, "Registry") {
+		t.Fatalf("Registry 来源未拒绝镜像变更: %#v", result)
+	}
+	config = &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	service = &ImageService{config: config, runner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		t.Fatal("无效引用不应执行 Docker 命令")
+		return nil, nil
+	}}
+	result = service.TagDockerImages("local", []DockerImageReferenceChange{{Source: "<none>:<none>", Target: "repo:new"}}, false)
+	if len(result.Failed) != 1 || !strings.Contains(result.Failed[0].Error, "无效") {
+		t.Fatalf("无效镜像引用未拒绝: %#v", result)
+	}
+}
+
+func TestImageMutationLimitsBatchOperations(t *testing.T) {
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
+	calls := 0
+	service := &ImageService{
+		config: config,
+		runner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			calls++
+			return nil, nil
+		},
+	}
+	changes := make([]DockerImageReferenceChange, 0, maxDockerImageOperations+1)
+	for i := 0; i < maxDockerImageOperations+1; i++ {
+		changes = append(changes, DockerImageReferenceChange{Source: fmt.Sprintf("repo:%d", i), Target: fmt.Sprintf("repo:new-%d", i)})
+	}
+	result := service.TagDockerImages("local", changes, false)
+	if calls != maxDockerImageOperations || len(result.Succeeded) != maxDockerImageOperations || len(result.Failed) != 1 {
+		t.Fatalf("批量限制结果为调用 %d、成功 %d、失败 %d", calls, len(result.Succeeded), len(result.Failed))
+	}
+}
+
 func TestDeleteDockerImagesDeduplicatesAndReturnsPartialResults(t *testing.T) {
 	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{{ID: "local", Kind: "local"}}})}
 	var calls [][]string
