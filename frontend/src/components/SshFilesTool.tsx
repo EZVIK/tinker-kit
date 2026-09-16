@@ -179,6 +179,21 @@ function remoteParent(value: string) {
   return index <= 0 ? '/' : normalized.slice(0, index);
 }
 
+function sshConnectionListingKey(connection: SSHConnection | null | undefined) {
+  if (!connection) return '';
+  return [
+    connection.mode,
+    connection.alias,
+    connection.host,
+    String(connection.port),
+    connection.username,
+    connection.password,
+    connection.privateKey,
+    connection.privateKeyPath,
+    connection.keyPassphrase,
+  ].join('\0');
+}
+
 const archiveFileExtensions = new Set([
   '7z',
   'apk',
@@ -434,10 +449,7 @@ type ProgressAnimation = {
 };
 
 function progressCatchUpDuration(interval: number) {
-  return Math.max(
-    progressMinCatchUpDuration,
-    Math.min(progressMaxCatchUpDuration, interval),
-  );
+  return Math.max(progressMinCatchUpDuration, Math.min(progressMaxCatchUpDuration, interval));
 }
 
 function useDisplayedTaskCompleted(task: FileTask) {
@@ -754,6 +766,7 @@ export default function SshFilesTool({ active }: Props) {
   const pendingFavoritePathRef = useRef<MissingFavoritePath | null>(null);
   const sourceIDRef = useRef(sourceID);
   const currentPathRef = useRef(currentPath);
+  const directoryLoadKeyRef = useRef('');
   const manageBaselineRef = useRef<{ connections: SSHConnection[]; sources: FileSource[] }>({
     connections: [],
     sources: [],
@@ -798,6 +811,21 @@ export default function SshFilesTool({ active }: Props) {
   const source = sources.find((item) => item.id === sourceID) ?? null;
   const favoritePaths = source?.favoritePaths ?? [];
   const isCurrentPathFavorite = favoritePaths.includes(currentPath);
+  const activeSourceConnectionID = source?.sshConnectionID ?? '';
+  const sourceDefaultPath = source?.defaultPath ?? '';
+  const connectionListingKey = useMemo(
+    () => sshConnectionListingKey(connections.find((item) => item.id === activeSourceConnectionID)),
+    [activeSourceConnectionID, connections],
+  );
+  const directoryLoadKey = sourceID
+    ? [
+        sourceID,
+        activeSourceConnectionID,
+        connectionListingKey,
+        currentPath,
+        showHidden ? '1' : '0',
+      ].join('\0')
+    : '';
   const fileDrag = useFileDragOver({
     enabled: active && Boolean(sourceID) && !loadingSources && !loading && !searching,
   });
@@ -1046,10 +1074,14 @@ export default function SshFilesTool({ active }: Props) {
   }, [active, applyTaskSnapshot, loading, loadingSources, openUploadDialog, searching]);
 
   useEffect(() => {
-    if (!active || !source) return;
+    if (!active || !sourceID) {
+      if (!active) directoryLoadKeyRef.current = '';
+      return;
+    }
+    if (manageOpen) return;
     const nextPath =
-      currentPath === '/' && source.defaultPath
-        ? normalizeRemotePath(source.defaultPath)
+      currentPath === '/' && sourceDefaultPath
+        ? normalizeRemotePath(sourceDefaultPath)
         : normalizeRemotePath(currentPath);
     if (nextPath !== currentPath) {
       setCurrentPath(nextPath);
@@ -1057,8 +1089,21 @@ export default function SshFilesTool({ active }: Props) {
       return;
     }
     setPathInput(currentPath);
-    void loadDirectory(source.id, currentPath, showHidden);
-  }, [active, source, currentPath, showHidden, loadDirectory]);
+    if (directoryLoadKeyRef.current === directoryLoadKey) return;
+    directoryLoadKeyRef.current = directoryLoadKey;
+    resetSearchState();
+    void loadDirectory(sourceID, currentPath, showHidden);
+  }, [
+    active,
+    currentPath,
+    directoryLoadKey,
+    loadDirectory,
+    manageOpen,
+    resetSearchState,
+    showHidden,
+    sourceDefaultPath,
+    sourceID,
+  ]);
 
   useEffect(() => {
     if (!active || !sourceID) return;
@@ -1190,7 +1235,6 @@ export default function SshFilesTool({ active }: Props) {
     setFavoritesSaving(true);
     try {
       await SaveSSHFileConfig(connections, nextSources);
-      if (isCurrentPath) resetSearchState();
       setSources(nextSources);
       setSourceDraft((current) =>
         current.id === sourceID ? { ...current, favoritePaths: nextFavoritePaths } : current,
@@ -1768,7 +1812,6 @@ export default function SshFilesTool({ active }: Props) {
     setManageFeedback(null);
     try {
       await SaveSSHFileConfig(nextConnections, nextSources);
-      resetSearchState();
       setConnections(nextConnections);
       setSources(nextSources);
       manageBaselineRef.current = {
