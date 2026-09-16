@@ -31,23 +31,31 @@ import (
 )
 
 const (
-	imageCommandTimeout     = 15 * time.Second
-	imagePushTimeout        = 5 * time.Minute
-	maxImageCommandOutput   = 8 << 20
-	maxDockerDeleteImages   = 100
-	maxSSHConfigFileSize    = 1 << 20
-	maxSSHConfigFiles       = 128
-	maxSSHConfigDepth       = 8
-	maxRegistryRepositories = 10000
-	maxRegistryTags         = 10000
-	maxRegistryBodySize     = 8 << 20
-	maxImageCacheEntries    = 512
-	maxImageCacheBytes      = 128 << 20
-	maxImageCacheEntryBytes = 2 << 20
-	registryConcurrency     = 4
-	imageDetailConcurrency  = 4
-	prewarmQueueSize        = 128
-	registryListTimeout     = 30 * time.Second
+	imageCommandTimeout         = 15 * time.Second
+	imagePushTimeout            = 5 * time.Minute
+	maxImageCommandOutput       = 8 << 20
+	maxDockerDeleteImages       = 100
+	maxSSHConfigFileSize        = 1 << 20
+	maxSSHConfigFiles           = 128
+	maxSSHConfigDepth           = 8
+	maxRegistryRepositories     = 10000
+	maxRegistryTags             = 10000
+	maxRegistryBodySize         = 8 << 20
+	maxImageCacheEntries        = 512
+	maxImageCacheBytes          = 128 << 20
+	maxImageCacheEntryBytes     = 2 << 20
+	registryConcurrency         = 4
+	imageDetailConcurrency      = 4
+	backgroundDetailConcurrency = imageDetailConcurrency - 1
+	prewarmQueueSize            = 128
+	registryListTimeout         = 30 * time.Second
+)
+
+type imageDetailRequestClass uint8
+
+const (
+	imageDetailForeground imageDetailRequestClass = iota
+	imageDetailBackground
 )
 
 // SSHConfigHost 是 ~/.ssh/config 中可以直接交给系统 ssh 的 Host 别名。
@@ -246,6 +254,7 @@ type ImageService struct {
 	eventEmitter          func(string, any)
 	registrySem           chan struct{}
 	detailSem             chan struct{}
+	backgroundDetailSem   chan struct{}
 	inventory             map[string]imageInventory
 	prewarmOnce           sync.Once
 	prewarmQueue          chan prewarmJob
@@ -1989,6 +1998,7 @@ func (s *ImageService) ensurePrewarmWorkers() {
 			s.prewarmGenerations = make(map[string]*prewarmGeneration)
 		}
 		s.detailSem = make(chan struct{}, imageDetailConcurrency)
+		s.backgroundDetailSem = make(chan struct{}, backgroundDetailConcurrency)
 		s.prewarmQueue = make(chan prewarmJob, prewarmQueueSize)
 		for i := 0; i < imageDetailConcurrency; i++ {
 			s.prewarmWG.Add(1)
@@ -2007,7 +2017,7 @@ func (s *ImageService) prewarmWorker() {
 			if !s.prewarmGenerationCurrent(job.sourceID, job.fingerprint, job.generation, job.ctx) {
 				continue
 			}
-			if _, err := s.inspectWithGeneration(job.sourceID, job.source, job.cliPath, job.fingerprint, job.imageID, job.repository, job.ctx, job.generation); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if _, err := s.inspectWithGeneration(job.sourceID, job.source, job.cliPath, job.fingerprint, job.imageID, job.repository, job.ctx, imageDetailBackground, job.generation); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				log.Printf("镜像详情预热失败 source=%s fingerprint=%s: %v", job.sourceID, job.fingerprint, redactImageError(err, job.source))
 			}
 		}
@@ -2022,16 +2032,36 @@ func (s *ImageService) prewarmGenerationCurrent(sourceID, fingerprint string, nu
 	return current && expected.Err() == nil && s.sourceFingerprintCurrent(sourceID, fingerprint)
 }
 
-func (s *ImageService) detailPermit(ctx context.Context) (func(), error) {
+func (s *ImageService) detailPermit(ctx context.Context, requestClass imageDetailRequestClass) (func(), error) {
 	s.ensurePrewarmWorkers()
+	backgroundAcquired := false
+	releaseBackground := func() {
+		if backgroundAcquired {
+			<-s.backgroundDetailSem
+			backgroundAcquired = false
+		}
+	}
+	if requestClass == imageDetailBackground {
+		select {
+		case s.backgroundDetailSem <- struct{}{}:
+			backgroundAcquired = true
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	select {
 	case s.detailSem <- struct{}{}:
 		if err := ctx.Err(); err != nil {
 			<-s.detailSem
+			releaseBackground()
 			return nil, err
 		}
-		return func() { <-s.detailSem }, nil
+		return func() {
+			<-s.detailSem
+			releaseBackground()
+		}, nil
 	case <-ctx.Done():
+		releaseBackground()
 		return nil, ctx.Err()
 	}
 }
@@ -2135,13 +2165,13 @@ func (s *ImageService) schedulePrewarm(sourceID string, source ImageSource, cliP
 }
 
 func (s *ImageService) inspectWithSnapshot(sourceID string, source ImageSource, cliPath, fingerprint, imageID, repository string) (DockerImageDetail, error) {
-	return s.inspectWithGeneration(sourceID, source, cliPath, fingerprint, imageID, repository, s.serviceContext(), 0)
+	return s.inspectWithGeneration(sourceID, source, cliPath, fingerprint, imageID, repository, s.serviceContext(), imageDetailForeground, 0)
 }
 
-func (s *ImageService) inspectWithGeneration(sourceID string, source ImageSource, cliPath, fingerprint, imageID, repository string, requestCtx context.Context, generation uint64) (DockerImageDetail, error) {
+func (s *ImageService) inspectWithGeneration(sourceID string, source ImageSource, cliPath, fingerprint, imageID, repository string, requestCtx context.Context, requestClass imageDetailRequestClass, generation uint64) (DockerImageDetail, error) {
 	digest, repository, cacheable := cacheIdentity(source, imageID, repository)
 	if !cacheable {
-		release, err := s.detailPermit(requestCtx)
+		release, err := s.detailPermit(requestCtx, requestClass)
 		if err != nil {
 			return DockerImageDetail{}, err
 		}
@@ -2164,7 +2194,7 @@ func (s *ImageService) inspectWithGeneration(sourceID string, source ImageSource
 		select {
 		case <-call.done:
 			if generation == 0 && (errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) && requestCtx.Err() == nil {
-				return s.inspectWithGeneration(sourceID, source, cliPath, fingerprint, imageID, repository, requestCtx, generation)
+				return s.inspectWithGeneration(sourceID, source, cliPath, fingerprint, imageID, repository, requestCtx, requestClass, generation)
 			}
 			return call.detail, call.err
 		case <-requestCtx.Done():
@@ -2184,7 +2214,7 @@ func (s *ImageService) inspectWithGeneration(sourceID string, source ImageSource
 		call.detail = detail
 		return detail, nil
 	}
-	release, err := s.detailPermit(requestCtx)
+	release, err := s.detailPermit(requestCtx, requestClass)
 	if err != nil {
 		call.err = err
 		return DockerImageDetail{}, err

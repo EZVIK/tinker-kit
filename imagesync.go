@@ -661,7 +661,7 @@ func (s *ImageService) enrichDockerWatchImages(ctx context.Context, worker *watc
 			defer wg.Done()
 			for index := range jobs {
 				base := images[index]
-				detail, err := s.inspectWithGeneration(worker.sourceID, source, cliPath, worker.currentFingerprint(), base.ID, "", ctx, 0)
+				detail, err := s.inspectWithGeneration(worker.sourceID, source, cliPath, worker.currentFingerprint(), base.ID, "", ctx, imageDetailBackground, 0)
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						s.logWatch(worker, "镜像详情加载失败 image="+base.ID+": "+redactImageError(err, source).Error())

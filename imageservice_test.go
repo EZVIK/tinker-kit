@@ -1057,6 +1057,202 @@ func TestImageDetailConcurrencyIsBoundedAcrossRequests(t *testing.T) {
 	wg.Wait()
 }
 
+func TestBackgroundImageDetailsLeaveForegroundPermit(t *testing.T) {
+	imageSource := ImageSource{ID: "local", Kind: "local"}
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{imageSource}})}
+	service := NewImageService(config)
+	service.cacheDir = t.TempDir()
+	defer service.shutdown()
+
+	source, cliPath, fingerprint, err := service.sourceSnapshot("local")
+	if err != nil {
+		t.Fatalf("读取本地来源失败: %v", err)
+	}
+	started := make(chan string, imageDetailConcurrency+1)
+	release := make(chan struct{})
+	var active, maximum int32
+	service.runner = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) < 3 || args[0] != "image" || args[1] != "inspect" {
+			return nil, errors.New("unexpected command")
+		}
+		current := atomic.AddInt32(&active, 1)
+		for {
+			old := atomic.LoadInt32(&maximum)
+			if current <= old || atomic.CompareAndSwapInt32(&maximum, old, current) {
+				break
+			}
+		}
+		started <- args[2]
+		<-release
+		atomic.AddInt32(&active, -1)
+		return []byte(fmt.Sprintf(`[{"Id":%q}]`, args[2])), nil
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < imageDetailConcurrency; i++ {
+		imageID := fmt.Sprintf("sha256:%064x", i+1)
+		wg.Add(1)
+		go func(imageID string) {
+			defer wg.Done()
+			if _, err := service.inspectWithGeneration("local", source, cliPath, fingerprint, imageID, "", service.serviceContext(), imageDetailBackground, 0); err != nil {
+				t.Errorf("后台详情失败: %v", err)
+			}
+		}(imageID)
+	}
+	for i := 0; i < backgroundDetailConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("后台详情未达到预期并发上限")
+		}
+	}
+
+	foregroundID := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	foregroundDone := make(chan error, 1)
+	go func() {
+		_, err := service.InspectDockerImage("local", foregroundID)
+		foregroundDone <- err
+	}()
+	select {
+	case imageID := <-started:
+		if imageID != foregroundID {
+			t.Fatalf("前台详情开始前不应启动第 4 个后台详情，实际为 %s", imageID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("前台详情未及时获得预留名额")
+	}
+
+	close(release)
+	wg.Wait()
+	select {
+	case err := <-foregroundDone:
+		if err != nil {
+			t.Fatalf("前台详情失败: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("前台详情未完成")
+	}
+	if got := atomic.LoadInt32(&maximum); got > imageDetailConcurrency {
+		t.Fatalf("详情最大并发为 %d，超过 %d", got, imageDetailConcurrency)
+	}
+}
+
+func TestForegroundImageDetailReusesBackgroundRequest(t *testing.T) {
+	imageSource := ImageSource{ID: "local", Kind: "local"}
+	config := &ConfigService{cfg: normalizeConfig(Config{ImageSources: []ImageSource{imageSource}})}
+	service := NewImageService(config)
+	service.cacheDir = t.TempDir()
+	defer service.shutdown()
+
+	source, cliPath, fingerprint, err := service.sourceSnapshot("local")
+	if err != nil {
+		t.Fatalf("读取本地来源失败: %v", err)
+	}
+	imageID := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	started := make(chan struct{})
+	secondStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls int32
+	service.runner = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) < 3 || args[0] != "image" || args[1] != "inspect" {
+			return nil, errors.New("unexpected command")
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(started)
+		} else {
+			secondStarted <- struct{}{}
+		}
+		<-release
+		return []byte(fmt.Sprintf(`[{"Id":%q}]`, args[2])), nil
+	}
+
+	backgroundDone := make(chan error, 1)
+	go func() {
+		_, err := service.inspectWithGeneration("local", source, cliPath, fingerprint, imageID, "", service.serviceContext(), imageDetailBackground, 0)
+		backgroundDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("后台详情未开始")
+	}
+
+	foregroundDone := make(chan error, 1)
+	go func() {
+		_, err := service.InspectDockerImage("local", imageID)
+		foregroundDone <- err
+	}()
+	select {
+	case <-secondStarted:
+		t.Fatal("前台详情未复用正在执行的后台请求")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("同镜像详情执行了 %d 次 inspect，期望 1 次", got)
+	}
+
+	close(release)
+	for name, done := range map[string]chan error{"后台": backgroundDone, "前台": foregroundDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s详情失败: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s详情未完成", name)
+		}
+	}
+}
+
+func TestCancelledBackgroundDetailPermitReleasesSlots(t *testing.T) {
+	service := NewImageService(nil)
+	defer service.shutdown()
+
+	foregroundReleases := make([]func(), imageDetailConcurrency)
+	for i := range foregroundReleases {
+		release, err := service.detailPermit(context.Background(), imageDetailForeground)
+		if err != nil {
+			t.Fatalf("占用前台详情名额失败: %v", err)
+		}
+		foregroundReleases[i] = release
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.detailPermit(ctx, imageDetailBackground)
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for len(service.backgroundDetailSem) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("后台详情未先取得后台名额")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("取消后台详情等待返回错误 %v，期望 context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("取消后台详情等待未完成")
+	}
+
+	foregroundReleases[0]()
+	backgroundRelease, err := service.detailPermit(context.Background(), imageDetailBackground)
+	if err != nil {
+		t.Fatalf("取消等待后后台详情名额未释放: %v", err)
+	}
+	backgroundRelease()
+	for _, release := range foregroundReleases[1:] {
+		release()
+	}
+}
+
 func TestParseDockerImageSize(t *testing.T) {
 	tests := map[string]int64{
 		"1B":        1,
