@@ -1042,8 +1042,8 @@ export default function ImageManagerTool({
       setSourceId(sources[0]?.id ?? LOCAL_SOURCE_ID);
   }, [sourceId, sources]);
 
+  // 列表组件在详情页仍保持挂载；watcher 不随 active 切换重启，返回列表复用现有快照，按后台定时轮次更新。
   useEffect(() => {
-    if (!active) return undefined;
     let mounted = true;
     const clientID = crypto.randomUUID();
     const sourceID = source.id;
@@ -1181,16 +1181,7 @@ export default function ImageManagerTool({
         watchCall.cancel();
       }
     };
-  }, [
-    active,
-    cliPath,
-    reloadNonce,
-    requestWatchReload,
-    restartWatch,
-    source.id,
-    sourceConfigKey,
-    t,
-  ]);
+  }, [cliPath, reloadNonce, requestWatchReload, restartWatch, source.id, sourceConfigKey, t]);
 
   useEffect(() => {
     if (!pending || pending.tool !== 'image-manager' || consumed.current === pending) return;
