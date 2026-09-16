@@ -1,4 +1,5 @@
 :root {
+  --app-titlebar-height: 38px;
   --code-editor-font-size: 12px;
   --overlay-scrollbar-hit-size: 12px;
   font-synthesis: none;
@@ -20,6 +21,10 @@ body,
 body {
   overflow: hidden;
   line-height: 1.6;
+}
+/* Base UI 模态内部 backdrop 使用内联 inset:0，会盖住标题栏导致无法拖动窗口。 */
+[data-base-ui-inert] {
+  top: var(--app-titlebar-height) !important;
 }
 button,
 input,
