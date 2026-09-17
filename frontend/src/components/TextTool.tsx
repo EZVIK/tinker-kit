@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from './ui/popover';
 import { Button } from './ui/button';
+import { Checkbox } from './ui/checkbox';
+import { Label } from './ui/label';
 import { useTranslation } from 'react-i18next';
 import { Copy, Trash } from '@phosphor-icons/react';
 import CodeMirror from '@uiw/react-codemirror';
 import { EditorView } from '@codemirror/view';
+import { closeSearchPanel, openSearchPanel } from '@codemirror/search';
 import { quietEditorTheme } from './codeMirrorTheme';
 import {
   type PendingAction,
@@ -58,6 +61,16 @@ const analyzeText = (value: string) => {
 };
 
 type CaseMode = 'upper' | 'lower' | 'lineUpper' | 'lineLower' | 'wordUpper' | 'wordLower';
+// 模块级常量避免每次渲染触发 CodeMirror reconfigure，导致搜索面板被重置关闭。
+const editorExtensions = [EditorView.lineWrapping];
+const editorBasicSetup = {
+  lineNumbers: true,
+  foldGutter: false,
+  highlightActiveLine: false,
+  highlightActiveLineGutter: false,
+  autocompletion: false,
+  closeBrackets: false,
+} as const;
 const caseModes: CaseMode[] = [
   'upper',
   'lower',
@@ -150,6 +163,7 @@ export default function TextTool({
 }) {
   const { t } = useTranslation();
   const [value, setValue] = useState('');
+  const [alwaysSearch, setAlwaysSearch] = useState(false);
   const consumed = useRef<PendingAction | null>(null);
   const inputView = useRef<EditorView | null>(null);
   useFocusOnActivate(active, () => inputView.current?.focus());
@@ -197,13 +211,52 @@ export default function TextTool({
     }
     setValue(pending.input);
   }, [pending, value]);
+  // 勾选后打开搜索栏并拦截 Esc / 关闭按钮，使其保持常驻；取消勾选时收起。
+  useEffect(() => {
+    const view = inputView.current;
+    if (!view) return;
+    if (!alwaysSearch) {
+      closeSearchPanel(view);
+      return;
+    }
+    openSearchPanel(view);
+    const panel = view.dom.querySelector<HTMLElement>('.cm-panel.cm-search');
+    if (!panel) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    const onClick = (event: MouseEvent) => {
+      if ((event.target as HTMLElement | null)?.closest('button[name="close"]')) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    panel.addEventListener('keydown', onKeyDown, true);
+    panel.addEventListener('click', onClick, true);
+    return () => {
+      panel.removeEventListener('keydown', onKeyDown, true);
+      panel.removeEventListener('click', onClick, true);
+    };
+  }, [alwaysSearch]);
   return (
     <Reveal index={0} fill active={active}>
       <ToolLayout>
         <ToolLayoutHeader title={t('textTool.title')} />
         <ToolLayoutContent className="grid grid-rows-[minmax(0,1fr)_auto] gap-3">
           <div className="flex min-h-0 min-w-0 flex-col gap-2 font-mono text-[10px] font-medium uppercase tracking-[.04em] text-muted-foreground">
-            <span>{t('textTool.input')}</span>
+            <span className="flex min-w-0 items-center justify-between gap-2">
+              <span>{t('textTool.input')}</span>
+              <Label className="min-w-0 gap-1.5 text-[11px] font-normal normal-case tracking-normal text-muted-foreground">
+                <Checkbox
+                  checked={alwaysSearch}
+                  onCheckedChange={(checked) => setAlwaysSearch(checked)}
+                />
+                <span>{t('textTool.alwaysShowSearch')}</span>
+              </Label>
+            </span>
             <CodeMirror
               className="min-h-0 flex-1 overflow-hidden rounded-lg border border-border bg-card focus-within:border-muted-foreground [&_.cm-editor]:h-full [&_.cm-editor.cm-focused]:outline-none [&_.cm-scroller]:overflow-auto"
               height="100%"
@@ -214,15 +267,8 @@ export default function TextTool({
                 inputView.current = view;
               }}
               theme={quietEditorTheme}
-              extensions={[EditorView.lineWrapping]}
-              basicSetup={{
-                lineNumbers: true,
-                foldGutter: false,
-                highlightActiveLine: false,
-                highlightActiveLineGutter: false,
-                autocompletion: false,
-                closeBrackets: false,
-              }}
+              extensions={editorExtensions}
+              basicSetup={editorBasicSetup}
             />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
