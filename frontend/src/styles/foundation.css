@@ -1,9 +1,19 @@
 :root {
-  --app-titlebar-height: 52px;
+  --app-titlebar-height: 38px;
+  --app-titlebar-pad-left: 76px;
+  --app-titlebar-item-offset: 1px;
+  --app-titlebar-toggle-offset: 1px;
   --code-editor-font-size: 12px;
   --overlay-scrollbar-hit-size: 12px;
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;
+}
+/* macOS 27 起系统窗口的红绿灯区域更宽更高，标题栏几何需独立适配；其余平台沿用默认值。 */
+:root[data-titlebar-variant='tall'] {
+  --app-titlebar-height: 52px;
+  --app-titlebar-pad-left: 96px;
+  --app-titlebar-item-offset: 3px;
+  --app-titlebar-toggle-offset: 2px;
 }
 .cm-content,
 .cm-content * {

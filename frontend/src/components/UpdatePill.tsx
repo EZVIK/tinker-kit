@@ -117,7 +117,7 @@ export default function UpdatePill() {
   if (working)
     return (
       <div
-        className="relative top-[3px] z-[3] flex h-6 max-w-[min(340px,calc(100vw-220px))] flex-none items-center self-center gap-1.5 ml-auto rounded-full border border-border bg-card py-0 px-1.5 text-foreground [--wails-draggable:no-drag]"
+        className="relative top-(--app-titlebar-item-offset) z-[3] flex h-6 max-w-[min(340px,calc(100vw-220px))] flex-none items-center self-center gap-1.5 ml-auto rounded-full border border-border bg-card py-0 px-1.5 text-foreground [--wails-draggable:no-drag]"
         role="status"
       >
         <Spinner className="size-3.5 flex-none self-center text-primary motion-reduce:animate-none" />
@@ -129,7 +129,7 @@ export default function UpdatePill() {
     );
   return (
     <div
-      className="relative top-[3px] z-[3] flex h-6 max-w-[min(340px,calc(100vw-220px))] flex-none items-center self-center gap-1.5 ml-auto overflow-hidden rounded-full border border-border bg-card py-0 px-0.5 text-foreground [--wails-draggable:no-drag] cursor-pointer hover:border-muted-foreground hover:bg-muted"
+      className="relative top-(--app-titlebar-item-offset) z-[3] flex h-6 max-w-[min(340px,calc(100vw-220px))] flex-none items-center self-center gap-1.5 ml-auto overflow-hidden rounded-full border border-border bg-card py-0 px-0.5 text-foreground [--wails-draggable:no-drag] cursor-pointer hover:border-muted-foreground hover:bg-muted"
       role="status"
     >
       <Button
