@@ -1158,7 +1158,7 @@ function AppShell() {
   const saveQueued = useRef(false);
   const saveWaiters = useRef<SaveWaiter[]>([]);
   const imageSourceSaveRequests = useRef<ImageSourceSaveRequest[]>([]);
-  const persistLatestRef = useRef<() => Promise<void>>(async () => { });
+  const persistLatestRef = useRef<() => Promise<void>>(async () => {});
   const startPersistLatest = () => {
     void persistLatestRef.current().catch((error) => {
       console.error('[settings] persist failed', error);
@@ -1685,7 +1685,7 @@ function AppShell() {
           try {
             parseJsonLoose(s);
             if (trayTools.has('json')) tool = 'json';
-          } catch { }
+          } catch {}
         if (!tool && trayTools.has('text')) tool = 'text';
       }
     }
@@ -1726,13 +1726,13 @@ function AppShell() {
       <div className="app-shell relative grid h-dvh grid-rows-[var(--app-titlebar-height)_minmax(0,1fr)] bg-background">
         <div className="ambient pointer-events-none absolute inset-0 z-0" />
         <header
-          className="titlebar relative z-[2] flex h-full cursor-default pointer-events-auto select-none items-center border-b border-border bg-background px-4 pl-[96px] [--wails-draggable:drag]"
+          className="titlebar relative z-[2] flex h-full cursor-default pointer-events-auto select-none items-center border-b border-border bg-background px-4 pl-(--app-titlebar-pad-left) [--wails-draggable:drag]"
           data-wails-drag
         >
           <Button
             variant="ghost"
             size="icon-sm"
-            className="sidebar-toggle relative top-[2px] flex-none self-center rounded-lg text-muted-foreground [--wails-draggable:no-drag] hover:bg-muted hover:text-foreground"
+            className="sidebar-toggle relative top-(--app-titlebar-toggle-offset) flex-none self-center rounded-lg text-muted-foreground [--wails-draggable:no-drag] hover:bg-muted hover:text-foreground"
             onClick={cycleSidebar}
             disabled={sidebarManaging}
             aria-label={t('sidebar.toggle')}
@@ -1740,7 +1740,7 @@ function AppShell() {
           >
             <SidebarSimple size={16} weight="duotone" />
           </Button>
-          <div className="titlebar-navigation relative top-[3px] ml-1 flex h-7 items-center gap-0.5 self-center [--wails-draggable:no-drag]">
+          <div className="titlebar-navigation relative top-(--app-titlebar-item-offset) ml-1 flex h-7 items-center gap-0.5 self-center [--wails-draggable:no-drag]">
             <Button
               variant="ghost"
               disabled={!canGoBack}
