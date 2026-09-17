@@ -380,6 +380,7 @@
     "title": "文本工具集",
     "actions": "文本操作",
     "input": "输入",
+    "alwaysShowSearch": "始终显示搜索栏",
     "case": "大小写",
     "caseModes": {
       "upper": "全部大写",

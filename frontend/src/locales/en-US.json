@@ -380,6 +380,7 @@
     "title": "Text Toolkit",
     "actions": "Text actions",
     "input": "Input",
+    "alwaysShowSearch": "Always show search bar",
     "case": "Case",
     "caseModes": {
       "upper": "UPPERCASE",
